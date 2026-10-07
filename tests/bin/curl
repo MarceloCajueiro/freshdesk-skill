@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Test shim standing in for curl, so the suite never touches the network.
+#
+# fd.sh calls `curl` unqualified, so putting this directory first on PATH
+# intercepts every request. It maps an API path to a fixture file, logs the
+# call, and answers with the status line fd.sh asks for through `-w`.
+#
+# Fixture name: the path after /api/v2/, query dropped, `/` turned into `.`
+#   /api/v2/tickets/123/conversations?page=1  ->  tickets.123.conversations.json
+# A page above 1 reads <name>.p<N>.json, or an empty array when there is none.
+# A path with no fixture answers 404 with an empty body, as Freshdesk does.
+#
+# Controlled by:
+#   FIXTURES          directory holding the fixtures
+#   CURL_LOG          one line per call: <METHOD> <url>
+#   CURL_ARGV_LOG     one line per call: every argument, space-separated
+#   CURL_CONFIG_LOG   whatever arrived on stdin through `--config -`
+#   CURL_BODY_DIR     each request payload, as body.<n>.json
+#   CURL_FAIL_URLS    substrings; a matching URL exits 7 (connection failure)
+#   CURL_HTTP_STATUS  answer every call with this status ...
+#   CURL_HTTP_BODY    ... and this body (default: empty)
+#   CURL_NOTE_PUBLIC  the created note comes back with "private": false
+set -uo pipefail
+
+method="GET" url="" payload="" wfmt="" config=""
+prev=""
+for arg in "$@"; do
+  case "$prev" in
+    -X) method="$arg" ;;
+    -d|--data) payload="$arg" ;;
+    -w) wfmt="$arg" ;;
+    --config|-K) [ "$arg" = "-" ] && config="$(cat)" ;;
+  esac
+  case "$arg" in http://*|https://*) url="$arg" ;; esac
+  prev="$arg"
+done
+
+[ -n "${CURL_LOG:-}" ] && printf '%s %s\n' "$method" "$url" >> "$CURL_LOG"
+[ -n "${CURL_ARGV_LOG:-}" ] && echo "$*" >> "$CURL_ARGV_LOG"
+[ -n "${CURL_CONFIG_LOG:-}" ] && [ -n "$config" ] && printf '%s\n' "$config" >> "$CURL_CONFIG_LOG"
+if [ -n "${CURL_BODY_DIR:-}" ] && [ -n "$payload" ]; then
+  mkdir -p "$CURL_BODY_DIR"
+  printf '%s' "$payload" > "$CURL_BODY_DIR/body.$(ls "$CURL_BODY_DIR" 2>/dev/null | wc -l | tr -d ' ').json"
+fi
+
+# Hard failure: simulates a refused connection, which curl reports as exit 7.
+for pat in ${CURL_FAIL_URLS:-}; do
+  case "$url" in *"$pat"*) exit 7 ;; esac
+done
+
+# Prints the body, then the status the way `-w '\n%{http_code}'` would.
+answer() {
+  printf '%s' "$2"
+  [ -n "$wfmt" ] && printf '\n%s' "$1"
+  exit 0
+}
+
+[ -n "${CURL_HTTP_STATUS:-}" ] && answer "$CURL_HTTP_STATUS" "${CURL_HTTP_BODY:-}"
+
+path="${url#*/api/v2/}"
+query=""
+case "$path" in *\?*) query="${path#*\?}" ;; esac
+name="$(printf '%s' "${path%%\?*}" | tr '/' '.')"
+
+page=1
+case "&$query" in
+  *"&page="*) page="&$query"; page="${page#*&page=}"; page="${page%%&*}" ;;
+esac
+
+fixture="$FIXTURES/$name.json"
+if [ "$page" != "1" ]; then
+  fixture="$FIXTURES/$name.p$page.json"
+  [ -f "$fixture" ] || answer 200 '[]'
+fi
+
+[ -f "$fixture" ] || answer 404 ''
+
+if [ "$method" = "POST" ]; then
+  if [ -n "${CURL_NOTE_PUBLIC:-}" ]; then
+    answer 201 "$(jq -c '.private = false' "$fixture")"
+  fi
+  answer 201 "$(cat "$fixture")"
+fi
+answer 200 "$(cat "$fixture")"
