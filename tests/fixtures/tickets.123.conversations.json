@@ -1,0 +1,6 @@
+[
+ {"id":1,"body_text":"Primeira mensagem do cliente","incoming":true,"private":false,"source":0,"user_id":501,"from_email":"maria@escola.example.org","ticket_id":123,"created_at":"2026-09-30T13:05:00Z"},
+ {"id":2,"body_text":"Encaminhado ao time de desenvolvimento.","incoming":false,"private":true,"source":2,"user_id":9002,"from_email":null,"ticket_id":123,"created_at":"2026-10-01T10:00:00Z"},
+ {"id":3,"body_text":"Estamos verificando, obrigado pela paciencia.","incoming":false,"private":false,"source":0,"user_id":9002,"from_email":"suporte@example.com","ticket_id":123,"created_at":"2026-10-02T11:30:00Z"},
+ {"id":4,"body_text":"Nota publica para o cliente.","incoming":false,"private":false,"source":2,"user_id":9002,"from_email":null,"ticket_id":123,"created_at":"2026-10-03T09:00:00Z"}
+]

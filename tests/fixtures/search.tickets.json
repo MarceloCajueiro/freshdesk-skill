@@ -1,0 +1,4 @@
+{"results":[
+ {"id":123,"subject":"Boletim nao gera PDF","status":2,"priority":3,"updated_at":"2026-10-06T18:40:12Z"},
+ {"id":124,"subject":"Erro ao lancar nota","status":3,"priority":2,"updated_at":"2026-10-05T08:00:00Z"}
+],"total":45}
