@@ -1,0 +1,59 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  bats:
+    # ubuntu gives bash 5.x, macos gives 3.2 as /bin/bash - fd.sh must work on both.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bats
+        uses: bats-core/bats-action@3.0.0
+        with:
+          # Without a version the action asks api.github.com for the latest
+          # release, unauthenticated; the shared macOS runner IPs exhaust that
+          # rate limit and the install fails with 403 before any test runs.
+          bats-version: 1.14.0
+          support-install: false
+          assert-install: false
+          detik-install: false
+          file-install: false
+
+      - name: Versions
+        run: |
+          bash --version | head -1
+          /bin/bash --version | head -1
+          jq --version
+
+      - name: Run suite
+        run: bats tests/fd.bats
+
+      - name: Run suite under /bin/bash (bash 3.2 on macOS)
+        run: FD_BASH=/bin/bash bats tests/fd.bats
+
+      - name: Suite must catch a note sent as public
+        # A suite that cannot fail proves nothing. The one defect this skill must
+        # never ship is a public note, so CI plants it and expects red.
+        run: |
+          sed 's/private: true}/private: false}/' freshdesk/fd.sh > /tmp/public_fd.sh
+          if cmp -s freshdesk/fd.sh /tmp/public_fd.sh; then
+            echo "The mutation did not apply: the note payload changed shape. Update this step."
+            exit 1
+          fi
+          if FD=/tmp/public_fd.sh bats tests/fd.bats > /tmp/public.log 2>&1; then
+            echo "The suite passed with notes sent as public - it has no power to fail."
+            cat /tmp/public.log
+            exit 1
+          fi
+          echo "Failures with notes sent as public, as expected:"
+          grep -c '^not ok' /tmp/public.log
