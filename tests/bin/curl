@@ -16,6 +16,7 @@
 #   CURL_ARGV_LOG     one line per call: every argument, space-separated
 #   CURL_CONFIG_LOG   whatever arrived on stdin through `--config -`
 #   CURL_BODY_DIR     each request payload, as body.<n>.json
+#   CURL_ENV_LOG      the environment curl was started with
 #   CURL_FAIL_URLS    substrings; a matching URL exits 7 (connection failure)
 #   CURL_HTTP_STATUS  answer every call with this status ...
 #   CURL_HTTP_BODY    ... and this body (default: empty)
@@ -37,6 +38,7 @@ done
 
 [ -n "${CURL_LOG:-}" ] && printf '%s %s\n' "$method" "$url" >> "$CURL_LOG"
 [ -n "${CURL_ARGV_LOG:-}" ] && echo "$*" >> "$CURL_ARGV_LOG"
+[ -n "${CURL_ENV_LOG:-}" ] && env >> "$CURL_ENV_LOG"
 [ -n "${CURL_CONFIG_LOG:-}" ] && [ -n "$config" ] && printf '%s\n' "$config" >> "$CURL_CONFIG_LOG"
 if [ -n "${CURL_BODY_DIR:-}" ] && [ -n "$payload" ]; then
   mkdir -p "$CURL_BODY_DIR"
