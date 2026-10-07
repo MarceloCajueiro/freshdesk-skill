@@ -77,41 +77,95 @@ lookup_snippet() {
   [ ! -s "$CURL_LOG" ]
 }
 
-@test "setup stores credentials from flags with mode 600" {
+@test "setup takes the domain from --domain and the key from stdin, with mode 600" {
   rm -rf "$XDG_CONFIG_HOME/freshdesk"
-  fd setup --domain https://acme.freshdesk.com/ --api-key K1
+  run "$FD_BASH" -c "printf '%s\n' K1 | '$FD' setup --domain https://acme.freshdesk.com/"
   [ "$status" -eq 0 ]
   local cfg="$XDG_CONFIG_HOME/freshdesk/config"
   [ "$(file_mode "$cfg")" = "600" ]
+  [ "$(file_mode "$XDG_CONFIG_HOME/freshdesk")" = "700" ]
   grep -qx 'FRESHDESK_DOMAIN=acme.freshdesk.com' "$cfg"   # scheme and slash stripped
   grep -qx 'FRESHDESK_API_KEY=K1' "$cfg"
+  [ "$(wc -l < "$cfg" | tr -d ' ')" -eq 2 ]
   [[ "$output" == *"Jane Doe <jane.doe@example.com>"* ]]   # verified right away
+  [ "$(ls "$XDG_CONFIG_HOME/freshdesk" | wc -l | tr -d ' ')" -eq 1 ]   # no temp file left
 }
 
-@test "setup defaults the domain to acme.freshdesk.com" {
+@test "setup refuses --api-key: a key in argv is visible through ps" {
   rm -rf "$XDG_CONFIG_HOME/freshdesk"
-  fd setup --api-key K1
-  [ "$status" -eq 0 ]
-  grep -qx 'FRESHDESK_DOMAIN=acme.freshdesk.com' "$XDG_CONFIG_HOME/freshdesk/config"
+  local form
+  for form in "--api-key SECRETKEY123" "--api-key=SECRETKEY123" "--domain acme --api-key SECRETKEY123"; do
+    # shellcheck disable=SC2086
+    fd setup $form
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"ps"* ]]
+    [[ "$output" != *"SECRETKEY123"* ]]
+    [ ! -e "$XDG_CONFIG_HOME/freshdesk/config" ]
+  done
+  [ ! -s "$CURL_LOG" ]
 }
 
-@test "setup accepts two piped lines, and an empty domain line takes the default" {
+@test "setup has no default domain" {
   rm -rf "$XDG_CONFIG_HOME/freshdesk"
   run "$FD_BASH" -c "printf '%s\n' '' K2 | '$FD' setup"
-  [ "$status" -eq 0 ]
-  grep -qx 'FRESHDESK_DOMAIN=acme.freshdesk.com' "$XDG_CONFIG_HOME/freshdesk/config"
-  grep -qx 'FRESHDESK_API_KEY=K2' "$XDG_CONFIG_HOME/freshdesk/config"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"needs your Freshdesk domain"* ]]
+  [ ! -e "$XDG_CONFIG_HOME/freshdesk/config" ]
+  [ ! -s "$CURL_LOG" ]
+}
 
+@test "setup accepts two piped lines, the domain as a name, a host or a URL" {
+  local d
+  for d in other other.freshdesk.com https://other.freshdesk.com/a/tickets/1; do
+    rm -rf "$XDG_CONFIG_HOME/freshdesk"
+    run "$FD_BASH" -c "printf '%s\n' '$d' K3 | '$FD' setup"
+    [ "$status" -eq 0 ]
+    grep -qx 'FRESHDESK_DOMAIN=other.freshdesk.com' "$XDG_CONFIG_HOME/freshdesk/config"
+    grep -qx 'FRESHDESK_API_KEY=K3' "$XDG_CONFIG_HOME/freshdesk/config"
+  done
+}
+
+@test "setup refuses a domain that is not a bare host name" {
+  local d
+  for d in 'acme.freshdesk.com@evil.example' 'acme.freshdesk.com:8443' 'acme.freshdesk.com?x' \
+           'acme .freshdesk.com' '.freshdesk.com' 'acme..com'; do
+    rm -rf "$XDG_CONFIG_HOME/freshdesk"
+    run "$FD_BASH" -c "printf '%s\n' K4 | '$FD' setup --domain '$d'"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"not a Freshdesk domain"* ]]
+    [ ! -e "$XDG_CONFIG_HOME/freshdesk/config" ]
+  done
+  [ ! -s "$CURL_LOG" ]
+}
+
+@test "setup refuses a key that could break out of curl's config" {
   rm -rf "$XDG_CONFIG_HOME/freshdesk"
-  run "$FD_BASH" -c "printf '%s\n' other K3 | '$FD' setup"
-  grep -qx 'FRESHDESK_DOMAIN=other.freshdesk.com' "$XDG_CONFIG_HOME/freshdesk/config"
+  run "$FD_BASH" -c "printf '%s\n' 'K\"' | '$FD' setup --domain acme"
+  [ "$status" -ne 0 ]
+  run "$FD_BASH" -c "printf '%s\n' 'K 5' | '$FD' setup --domain acme"
+  [ "$status" -ne 0 ]
+  [ ! -e "$XDG_CONFIG_HOME/freshdesk/config" ]
+}
+
+@test "setup replaces a symlinked config instead of writing through it" {
+  rm -rf "$XDG_CONFIG_HOME/freshdesk"
+  mkdir -p "$XDG_CONFIG_HOME/freshdesk"
+  : > "$TMP/elsewhere"
+  ln -s "$TMP/elsewhere" "$XDG_CONFIG_HOME/freshdesk/config"
+  run "$FD_BASH" -c "printf '%s\n' K6 | '$FD' setup --domain acme"
+  [ "$status" -eq 0 ]
+  [ ! -s "$TMP/elsewhere" ]
+  [ ! -L "$XDG_CONFIG_HOME/freshdesk/config" ]
+  [ "$(file_mode "$XDG_CONFIG_HOME/freshdesk/config")" = "600" ]
 }
 
 @test "setup never echoes the API key" {
   rm -rf "$XDG_CONFIG_HOME/freshdesk"
-  fd setup --api-key SECRETKEY123
+  run "$FD_BASH" -c "printf '%s\n' SECRETKEY123 | '$FD' setup --domain acme"
+  [ "$status" -eq 0 ]
   [[ "$output" != *"SECRETKEY123"* ]]
-  run "$FD_BASH" -c "printf '%s\n' '' SECRETKEY456 | '$FD' setup"
+  run "$FD_BASH" -c "printf '%s\n' acme SECRETKEY456 | '$FD' setup"
+  [ "$status" -eq 0 ]
   [[ "$output" != *"SECRETKEY456"* ]]
 }
 
@@ -164,6 +218,48 @@ lookup_snippet() {
     [[ "$output" != *"FAKEKEY"* ]]
   done
   [ "$(grep -c 'FAKEKEY' "$CURL_ARGV_LOG")" -eq 0 ]
+}
+
+@test "a config written before this version still works unchanged" {
+  # The two-line file every earlier setup wrote, with the domain it defaulted to.
+  printf 'FRESHDESK_DOMAIN=legacy.freshdesk.com\nFRESHDESK_API_KEY=FAKEKEY\n' \
+    > "$XDG_CONFIG_HOME/freshdesk/config"
+  fd whoami
+  [ "$status" -eq 0 ]
+  grep -qx 'GET https://legacy.freshdesk.com/api/v2/agents/me' "$CURL_LOG"
+}
+
+@test "a domain from the environment cannot send the key to another host" {
+  local d
+  for d in 'acme.freshdesk.com@evil.example' 'evil.example:443' 'acme.freshdesk.com#x'; do
+    run env FRESHDESK_DOMAIN="$d" "$FD_BASH" "$FD" whoami
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"not a host name"* ]]
+  done
+  [ ! -s "$CURL_LOG" ]
+}
+
+@test "a key that would inject a curl directive is refused before any request" {
+  run env FRESHDESK_API_KEY=$'K"\noutput = "/tmp/x' "$FD_BASH" "$FD" whoami
+  [ "$status" -ne 0 ]
+  [ ! -s "$CURL_LOG" ]
+}
+
+@test "an API key from the environment is not exported to curl" {
+  run env FRESHDESK_API_KEY=ENVKEY CURL_ENV_LOG="$TMP/env.log" "$FD_BASH" "$FD" whoami
+  [ "$status" -eq 0 ]
+  [ -s "$TMP/env.log" ]
+  [ "$(grep -c 'ENVKEY' "$TMP/env.log")" -eq 0 ]
+}
+
+@test "curl ignores ~/.curlrc, is held to HTTPS and never follows a redirect" {
+  fd whoami
+  local argv
+  argv="$(head -1 "$CURL_ARGV_LOG")"
+  [[ "$argv" == "-q "* ]]
+  [[ "$argv" == *"--proto =https"* ]]
+  [ "$(grep -c -e ' -L' -e '--location' -e '--insecure' -e ' -k' "$CURL_ARGV_LOG")" -eq 0 ]
+  [[ "$argv" == *"-X GET https://acme.freshdesk.com/api/v2/agents/me" ]]   # method and URL last
 }
 
 # --- whoami -------------------------------------------------------------------
@@ -242,6 +338,21 @@ lookup_snippet() {
   text="$(printf '%s\n' "$output" | grep 'PRIVATE NOTE' | awk -F'\t' '{print $4}')"
   [[ "$text" == *" [...]" ]]
   [ "${#text}" -lt 320 ]
+}
+
+@test "ticket strips terminal escape sequences from customer text" {
+  cp -R "$FIXTURES" "$TMP/fx"
+  jq '.subject = "Boletim\u001b[2J\u001b]0;pwned\u0007" | .requester.name = "Maria\u001b[31m"' \
+    "$FIXTURES/tickets.123.json" > "$TMP/fx/tickets.123.json"
+  jq -n '[{id:1, body_text:"hi\u001b[8mhidden\u009b31m", private:false, incoming:true, source:0,
+          user_id:1, from_email:"c@x.org", created_at:"2026-10-01T10:00:00Z"}]' \
+    > "$TMP/fx/tickets.123.conversations.json"
+  FIXTURES="$TMP/fx" fd ticket 123
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s' "$output" | LC_ALL=C grep -c $'\e')" -eq 0 ]
+  [ "$(printf '%s' "$output" | LC_ALL=C grep -c $'\a')" -eq 0 ]
+  [ "$(printf '%s' "$output" | LC_ALL=C grep -c $'\xc2\x9b')" -eq 0 ]
+  [[ "$output" == *"hidden"* ]]   # the text stays readable, only the controls go
 }
 
 @test "ticket reports a missing ticket as 404, not as empty output" {
@@ -348,6 +459,22 @@ lookup_snippet() {
   [ "$status" -eq 0 ]
   [ "$(payload | jq -r .private)" = "true" ]
   [ "$(payload | jq -r .body)" = 'Line one &amp; &lt;two&gt;<br>See <a href="https://github.com/acme/app/issues/42">https://github.com/acme/app/issues/42</a><br><br>Thanks' ]
+}
+
+@test "a URL in a note cannot break out of the link's attribute" {
+  fd note 123 $'https://x.example/"onclick="alert(1)\nit\'s fine'
+  [ "$status" -eq 0 ]
+  [ "$(payload | jq -r .body)" = '<a href="https://x.example/">https://x.example/</a>&quot;onclick=&quot;alert(1)<br>it&#39;s fine' ]
+}
+
+@test "a note that contains the API key is refused before any request" {
+  fd note 123 "the key is FAKEKEY, see"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"contains your Freshdesk API key"* ]]
+  [[ "$output" != *"FAKEKEY"* ]]
+  fd note-file 123 "$XDG_CONFIG_HOME/freshdesk/config"
+  [ "$status" -ne 0 ]
+  [ ! -s "$CURL_LOG" ]
 }
 
 @test "--notify adds the agents to notify_emails, and the note stays private" {

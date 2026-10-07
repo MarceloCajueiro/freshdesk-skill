@@ -11,7 +11,6 @@ set -euo pipefail
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/freshdesk"
 CONFIG_FILE="$CONFIG_DIR/config"
-FD_DEFAULT_DOMAIN="acme.freshdesk.com"
 
 # Env wins over the config file, as CLI convention requires.
 _fd_env_domain="${FRESHDESK_DOMAIN:-}"
@@ -33,6 +32,9 @@ fi
 FRESHDESK_DOMAIN="${_fd_env_domain:-$FRESHDESK_DOMAIN}"
 FRESHDESK_API_KEY="${_fd_env_key:-$FRESHDESK_API_KEY}"
 unset _fd_env_domain _fd_env_key
+# A value that came from the environment stays a plain shell variable: curl
+# and jq, the only child processes, have no use for the key in theirs.
+export -n FRESHDESK_DOMAIN FRESHDESK_API_KEY
 
 # Dependencies, checked once with an actionable message instead of a cryptic failure.
 for _fd_dep in curl jq; do
@@ -57,64 +59,99 @@ fd_normalize_domain() {
   printf '%s' "$d"
 }
 
+# A host name and nothing else: no userinfo (`x@evil.example`), port, query or
+# fragment can ride along into the URL that carries the key.
+fd_valid_domain() {
+  case "$1" in
+    ""|.*|*.|*..*|*[!A-Za-z0-9.-]*) return 1 ;;
+  esac
+}
+
+# The key is written into curl's config as a quoted string, and into the config
+# file one line per value. A quote, backslash, space or control character could
+# break out of either, so such a key is refused. Freshdesk keys are alphanumeric.
+fd_valid_key() {
+  case "$1" in
+    ""|*[![:graph:]]*|*[\"\\]*) return 1 ;;
+  esac
+}
+
 cmd_setup() {
   local domain="" key="" have_domain=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --domain)  domain="${2:-}"; have_domain=1; shift 2 ;;
-      --api-key) key="${2:-}"; shift 2 ;;
+      --api-key|--api-key=*)
+        echo "ERROR: --api-key is not accepted: a key in the arguments is visible to every process through 'ps' and stays in the shell history." >&2
+        echo "Run 'fd.sh setup' in a terminal to type it at a hidden prompt, or pipe it: <command that prints the key> | fd.sh setup --domain DOMAIN" >&2
+        return 1 ;;
       -h|--help)
-        echo "usage: fd.sh setup [--domain DOMAIN --api-key KEY]"
-        echo "with no flags, prompts interactively. The domain defaults to $FD_DEFAULT_DOMAIN."
+        echo "usage: fd.sh setup [--domain DOMAIN]"
+        echo "In a terminal, prompts for the domain (unless given) and the API key, hidden."
+        echo "Otherwise reads them from stdin, one per line: the domain (unless --domain is given), then the key."
+        echo "DOMAIN is acme, acme.freshdesk.com or https://acme.freshdesk.com."
         return 0 ;;
       *) echo "unknown option: $1" >&2; return 1 ;;
     esac
   done
 
-  if [ -z "$key" ]; then
-    # Only a terminal gets the prompts; a pipe feeding two lines still works.
-    # On stdin that never delivers - an agent's inherited descriptor - the read
-    # times out instead of hanging until the caller's own timeout.
-    local fd_read_opts=()
-    if [ -t 0 ]; then
-      echo "Freshdesk setup. Your API key is in Freshdesk, at:"
-      echo "  Profile picture (top right) > Profile settings > View API key"
-      echo
-    else
-      fd_read_opts=(-t "${FD_SETUP_READ_TIMEOUT:-10}")
-    fi
-
-    fd_prompt() {  # fd_prompt <var-name> <label> [hidden]
-      local __var="$1" __label="$2" __hidden="${3:-}" __value=""
-      [ -t 0 ] && printf '%s' "$__label"
-      if [ -n "$__hidden" ] && [ -t 0 ]; then
-        # read -s keeps the key off the screen and out of the shell history.
-        read -rs ${fd_read_opts[@]+"${fd_read_opts[@]}"} __value || __value=""
-        echo
-      else
-        read -r ${fd_read_opts[@]+"${fd_read_opts[@]}"} __value || __value=""
-      fi
-      printf -v "$__var" '%s' "$__value"
-    }
-
-    if [ "$have_domain" -eq 0 ]; then
-      fd_prompt domain "Freshdesk domain [$FD_DEFAULT_DOMAIN]: "
-    fi
-    fd_prompt key 'API key (input hidden): ' hidden
-
-    if [ -z "$key" ]; then
-      echo "ERROR: setup needs a terminal, two piped lines (domain, API key), or the --api-key flag." >&2
-      return 1
-    fi
+  # Only a terminal gets the prompts; a pipe feeding the lines still works.
+  # On stdin that never delivers - an agent's inherited descriptor - the read
+  # times out instead of hanging until the caller's own timeout.
+  local fd_read_opts=()
+  if [ -t 0 ]; then
+    echo "Freshdesk setup. Your API key is in Freshdesk, at:"
+    echo "  Profile picture (top right) > Profile settings > View API key"
+    echo
+  else
+    fd_read_opts=(-t "${FD_SETUP_READ_TIMEOUT:-10}")
   fi
 
-  [ -n "$domain" ] || domain="$FD_DEFAULT_DOMAIN"
-  domain="$(fd_normalize_domain "$domain")"
+  fd_prompt() {  # fd_prompt <var-name> <label> [hidden]
+    local __var="$1" __label="$2" __hidden="${3:-}" __value=""
+    [ -t 0 ] && printf '%s' "$__label"
+    if [ -n "$__hidden" ] && [ -t 0 ]; then
+      # read -s keeps the key off the screen and out of the shell history.
+      read -rs ${fd_read_opts[@]+"${fd_read_opts[@]}"} __value || __value=""
+      echo
+    else
+      read -r ${fd_read_opts[@]+"${fd_read_opts[@]}"} __value || __value=""
+    fi
+    printf -v "$__var" '%s' "$__value"
+  }
 
-  mkdir -p "$CONFIG_DIR"
+  [ "$have_domain" -eq 1 ] || fd_prompt domain 'Freshdesk domain (acme, acme.freshdesk.com or a URL): '
+  domain="$(fd_normalize_domain "$domain")"
+  if [ -z "$domain" ]; then
+    echo "ERROR: setup needs your Freshdesk domain. Run it in a terminal, or pipe two lines: the domain, then the API key." >&2
+    return 1
+  fi
+  if ! fd_valid_domain "$domain"; then
+    echo "ERROR: not a Freshdesk domain: $domain. Use acme, acme.freshdesk.com or https://acme.freshdesk.com." >&2
+    return 1
+  fi
+
+  fd_prompt key 'API key (input hidden): ' hidden
+  if [ -z "$key" ]; then
+    echo "ERROR: setup needs the API key. Run it in a terminal, or pipe it on stdin." >&2
+    return 1
+  fi
+  if ! fd_valid_key "$key"; then
+    echo "ERROR: that API key has spaces, quotes or other characters a Freshdesk key never has. Copy it again from Freshdesk." >&2
+    return 1
+  fi
+
+  # umask first, so neither the directory nor the file ever exists with wider
+  # permissions. The file is written beside the config and renamed over it: an
+  # existing file or symlink in its place is replaced, never written through.
   umask 077
-  printf 'FRESHDESK_DOMAIN=%s\nFRESHDESK_API_KEY=%s\n' "$domain" "$key" > "$CONFIG_FILE"
-  chmod 600 "$CONFIG_FILE"
+  mkdir -p "$CONFIG_DIR"
+  chmod 700 "$CONFIG_DIR"
+  local tmp
+  tmp=$(mktemp "$CONFIG_DIR/config.XXXXXX")
+  printf 'FRESHDESK_DOMAIN=%s\nFRESHDESK_API_KEY=%s\n' "$domain" "$key" > "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$CONFIG_FILE"
 
   FRESHDESK_DOMAIN="$domain"
   FRESHDESK_API_KEY="$key"
@@ -135,6 +172,20 @@ fi
 
 FRESHDESK_DOMAIN="$(fd_normalize_domain "$FRESHDESK_DOMAIN")"
 BASE="https://$FRESHDESK_DOMAIN"
+
+# Checked on every run, not only at setup: the environment can override the
+# file, and a bad value here would put the key in a request to the wrong host,
+# or inject a directive into curl's config.
+if [ "${1:-}" != "setup" ] && [ -n "${1:-}" ]; then
+  fd_valid_domain "$FRESHDESK_DOMAIN" || {
+    echo "ERROR: FRESHDESK_DOMAIN is not a host name: $FRESHDESK_DOMAIN. Run 'fd.sh setup' again." >&2
+    exit 1
+  }
+  fd_valid_key "$FRESHDESK_API_KEY" || {
+    echo "ERROR: FRESHDESK_API_KEY has characters a Freshdesk key never has. Run 'fd.sh setup' again." >&2
+    exit 1
+  }
+fi
 
 # The single door to the API. Prints the response body, then a last line with
 # the HTTP status (000 when the network failed, `refused` when the allowlist
@@ -165,13 +216,17 @@ fd_curl() {
 
   # The key goes in through --config on stdin, never as an argument: argv is
   # readable by every process on the machine through `ps`.
+  # -q, first, skips ~/.curlrc, so no `insecure`, `location` or `proxy` set there
+  # applies to a request carrying the key. --proto keeps it on HTTPS. There is
+  # no -L: a redirect is answered as a non-200, never followed to another host.
+  # -X and the URL come after the caller's arguments, so they always win.
   local out
   if ! out=$(printf 'user = "%s:X"\n' "$FRESHDESK_API_KEY" \
-      | curl -sS --config - --max-time "${FD_HTTP_TIMEOUT:-20}" ${retry[@]+"${retry[@]}"} \
-          -X "$method" "$BASE$path" \
+      | curl -q -sS --config - --proto =https --max-time "${FD_HTTP_TIMEOUT:-20}" ${retry[@]+"${retry[@]}"} \
           -H "Content-Type: application/json" \
           -w '\n%{http_code}' \
-          "$@" 2>/dev/null); then
+          "$@" \
+          -X "$method" "$BASE$path" 2>/dev/null); then
     printf '\n000\n'
     return 0
   fi
@@ -236,13 +291,18 @@ fd_ticket_id() {
 fd_ticket_link() { printf '%s/a/tickets/%s' "$BASE" "$1"; }
 
 # jq helpers shared by every view of a ticket. Single quotes: these are jq, not shell.
+# scrub runs over every response before it is printed: ticket text is written by
+# customers, and an escape sequence in it would reach the terminal raw.
 # shellcheck disable=SC2016
 FD_JQ_DEFS='
   def status_name: {"2":"Open","3":"Pending","4":"Resolved","5":"Closed",
                     "6":"Waiting on Customer","7":"Waiting on Third Party"}[tostring] // "status \(.)";
   def priority_name: {"1":"Low","2":"Medium","3":"High","4":"Urgent"}[tostring] // "priority \(.)";
   def day: if . == null then "?" else sub("\\.[0-9]+"; "") | fromdateiso8601 | strflocaltime("%Y-%m-%d %H:%M") end;
-  def oneline: gsub("[\r\n\t]+"; " ") | gsub("  +"; " ") | ltrimstr(" ") | rtrimstr(" ");
+  def scrub: if type == "string" then gsub("[[:cntrl:]]+"; " ")
+             elif type == "object" then map_values(scrub)
+             elif type == "array" then map(scrub) else . end;
+  def oneline: gsub("[[:cntrl:]]+"; " ") | gsub("  +"; " ") | ltrimstr(" ") | rtrimstr(" ");
   def clip($n): if length > $n then .[0:$n] + " [...]" else . end;
 '
 
@@ -250,7 +310,7 @@ cmd_whoami() {
   local body
   body=$(fd_get "/api/v2/agents/me" "agent")
   case "$body" in ERROR:*) printf '%s\n' "$body"; return 0 ;; esac
-  printf '%s' "$body" | jq -r '"\(.contact.name // "?") <\(.contact.email // "?")>"'
+  printf '%s' "$body" | jq -r "$FD_JQ_DEFS"'scrub | "\(.contact.name // "?") <\(.contact.email // "?")>"'
 }
 
 # ticket <id|#id|url> - summary of one ticket, with its most recent conversations.
@@ -278,6 +338,7 @@ cmd_ticket() {
 
   printf '%s' "$ticket" | jq -r --arg link "$(fd_ticket_link "$id")" \
     --argjson convs "$all" --argjson last "${FD_CONVERSATIONS:-5}" "$FD_JQ_DEFS"'
+    scrub | ($convs | scrub) as $convs |
     "#\(.id)  \(.subject // "(no subject)")",
     "Status: \(.status | status_name) | Priority: \(.priority | priority_name)\(if .type then " | Type: \(.type)" else "" end)",
     "Requester: \(.requester.name // "?")\(if .requester.email then " <\(.requester.email)>" else "" end)",
@@ -303,7 +364,7 @@ cmd_ticket() {
 # Internal: prints one TSV line per ticket of a JSON array.
 fd_ticket_rows() {
   jq -r --arg base "$BASE" "$FD_JQ_DEFS"'
-    .[] | [(.updated_at | day), "#\(.id)", (.status | status_name),
+    .[] | scrub | [(.updated_at | day), "#\(.id)", (.status | status_name),
            ((.subject // "") | oneline | clip(200)), "\($base)/a/tickets/\(.id)"] | @tsv'
 }
 
@@ -359,10 +420,12 @@ cmd_search() {
 }
 
 # Internal: plain text to the HTML a note body is. Escapes markup, keeps line
-# breaks, and turns bare URLs into links.
+# breaks, and turns bare URLs into links. Quotes are escaped too, and a URL
+# stops at one: otherwise `https://x"onclick="...` would add an attribute.
 FD_JQ_HTML='
   gsub("&"; "&amp;") | gsub("<"; "&lt;") | gsub(">"; "&gt;")
-  | gsub("(?<u>https?://[^\\s<]+)"; "<a href=\"\(.u)\">\(.u)</a>")
+  | gsub("\""; "&quot;") | gsub("\u0027"; "&#39;")
+  | gsub("(?<u>https?://(?:(?!&quot;|&#39;)[^\\s<])+)"; "<a href=\"\(.u)\">\(.u)</a>")
   | gsub("\r?\n"; "<br>")
 '
 
@@ -374,6 +437,11 @@ fd_post_note() {
   id=$(fd_ticket_id "$arg")
   [ -n "$id" ] || { echo "ERROR: not a ticket id or ticket link: $arg"; return 1; }
   [ -n "$(printf '%s' "$text" | tr -d '[:space:]')" ] || { echo "ERROR: the note is empty"; return 1; }
+  # A note is read by everyone on the ticket. `note-file` on the config file,
+  # by mistake or because a ticket asked for it, must not publish the key.
+  case "$text" in
+    *"$FRESHDESK_API_KEY"*) echo "ERROR: the note contains your Freshdesk API key; it was not sent."; return 1 ;;
+  esac
 
   local emails='[]' e
   for e in "$@"; do
