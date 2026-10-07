@@ -49,9 +49,11 @@ The prompt hides the API key as it is typed.
 
 This skill exists to talk to the **support team**, never to the customer.
 
-- It reads tickets and adds **private notes**. Those are the only two actions.
+- It reads tickets and adds **private notes**.
+  Those are the only two actions.
 - It **never replies to the customer**, never posts a public note, and never changes a ticket's status, priority, assignment, tags or fields.
-- `fd.sh` has no command for any of that, and refuses any option that asks for it (`--public`, `--private=false`, `--reply`...). Its HTTP layer refuses every write except a POST to a ticket's notes, and the note payload always carries `"private": true`.
+- `fd.sh` has no command for any of that, and refuses any option that asks for it (`--public`, `--private=false`, `--reply`...).
+  Its HTTP layer refuses every write except a POST to a ticket's notes, and the note payload always carries `"private": true`.
 
 If the user asks to answer the customer, to close or reassign the ticket, or to make the note public, say plainly that this skill cannot do it, and offer a private note asking the support team to do it instead.
 Never work around the rule with `curl` or any other tool.
@@ -81,7 +83,8 @@ Older tickets, and words that appear only in the body, are not seen - say so ins
 `FD_SEARCH_DAYS` and `FD_SEARCH_PAGES` (100 tickets each) widen the window.
 
 - Use 1 to 3 distinctive words the customer would put in a subject, not the user's sentence: every word must match.
-- Accents count: `boletim` will not match `boletím`. When unsure, use the shortest unaccented word.
+- Accents count: `boletim` will not match `boletím`.
+  When unsure, use the shortest unaccented word.
 
 **A filter query** - anything with `field:` - goes to Freshdesk's filter API as is:
 
@@ -136,8 +139,10 @@ Write in the user's language, in their voice: an internal message between collea
 
 - **Say what support needs to do**, in the first line: check something with the client, confirm a detail, tell them a fix is out.
 - **Give the context** in a sentence or two: what was found, what changed.
-- **Link the work.** GitHub references are always repository-qualified: `portabilis/i-educar#123`, or the full URL. A bare `#123` means nothing inside Freshdesk.
-- Keep it short. Support reads notes in a ticket view, not a document.
+- **Link the work.** GitHub references are always repository-qualified: `portabilis/i-educar#123`, or the full URL.
+  A bare `#123` means nothing inside Freshdesk.
+- Keep it short.
+  Support reads notes in a ticket view, not a document.
 
 The note is plain text: line breaks are kept, URLs become links, and markup characters are shown literally.
 
@@ -166,11 +171,17 @@ Open the ticket with `fd.sh ticket` and check the latest conversations first.
 # Common errors
 
 - `ERROR: no credentials` → run `fd.sh setup`.
-- `ERROR: invalid API key (401)` → the key is wrong or was regenerated. Get the current one in Freshdesk (profile picture > Profile settings > View API key) and run `fd.sh setup` again.
-- `ERROR: forbidden (403)` → this agent's role or group cannot see that ticket. It exists; it is out of reach for this account.
-- `ERROR: not found (404)` → wrong ticket number, **or** a ticket this agent cannot see. Never tell the user it does not exist.
-- `ERROR: rate limited (429)` → the account's per-minute API quota is spent, often by other integrations. Wait a minute and retry once.
-- `ERROR: refused by this skill` → something asked for a write other than a private note. That is the rule working, not a bug.
-- `NONE` on a plain-word search → the ticket may be older than the scanned window, or the words are only in its body. Widen `FD_SEARCH_DAYS` / `FD_SEARCH_PAGES`, or ask for the ticket number.
+- `ERROR: invalid API key (401)` → the key is wrong or was regenerated.
+  Get the current one in Freshdesk (profile picture > Profile settings > View API key) and run `fd.sh setup` again.
+- `ERROR: forbidden (403)` → this agent's role or group cannot see that ticket.
+  It exists; it is out of reach for this account.
+- `ERROR: not found (404)` → wrong ticket number, **or** a ticket this agent cannot see.
+  Never tell the user it does not exist.
+- `ERROR: rate limited (429)` → the account's per-minute API quota is spent, often by other integrations.
+  Wait a minute and retry once.
+- `ERROR: refused by this skill` → something asked for a write other than a private note.
+  That is the rule working, not a bug.
+- `NONE` on a plain-word search → the ticket may be older than the scanned window, or the words are only in its body.
+  Widen `FD_SEARCH_DAYS` / `FD_SEARCH_PAGES`, or ask for the ticket number.
 
 Never print the API key, not even in debug output.
