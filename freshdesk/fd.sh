@@ -115,7 +115,9 @@ cmd_setup() {
       read -rs ${fd_read_opts[@]+"${fd_read_opts[@]}"} __value || __value=""
       echo
     else
-      read -r ${fd_read_opts[@]+"${fd_read_opts[@]}"} __value || __value=""
+      # A last line with no newline (`pbpaste | fd.sh setup ...`) ends in EOF,
+      # status 1, and is kept; only a timeout (status above 128) discards input.
+      read -r ${fd_read_opts[@]+"${fd_read_opts[@]}"} __value || { [ $? -le 128 ] || __value=""; }
     fi
     printf -v "$__var" '%s' "$__value"
   }

@@ -91,6 +91,13 @@ lookup_snippet() {
   [ "$(ls "$XDG_CONFIG_HOME/freshdesk" | wc -l | tr -d ' ')" -eq 1 ]   # no temp file left
 }
 
+@test "setup keeps a piped key that has no trailing newline" {
+  rm -rf "$XDG_CONFIG_HOME/freshdesk"
+  run "$FD_BASH" -c "printf '%s' K7 | '$FD' setup --domain acme"
+  [ "$status" -eq 0 ]
+  grep -qx 'FRESHDESK_API_KEY=K7' "$XDG_CONFIG_HOME/freshdesk/config"
+}
+
 @test "setup refuses --api-key: a key in argv is visible through ps" {
   rm -rf "$XDG_CONFIG_HOME/freshdesk"
   local form
