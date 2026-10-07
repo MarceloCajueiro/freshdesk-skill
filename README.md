@@ -37,18 +37,22 @@ Then set up credentials once:
 ~/.claude/skills/freshdesk/fd.sh setup
 ```
 
-It prompts for the Freshdesk domain (default `portabilis.freshdesk.com`) and your API key, hiding the key as you type.
-Non-interactive, for a dotfiles or provisioning script:
+It asks for your Freshdesk domain and your API key, hiding the key as you type.
+There is no default domain.
+Non-interactive, for a dotfiles or provisioning script, pipe the key on stdin:
 
 ```bash
-fd.sh setup --domain yourcompany.freshdesk.com --api-key YOUR_KEY
+# the key from a secret manager, never typed on the command line
+op read "op://Private/Freshdesk/api key" | fd.sh setup --domain yourcompany
 
-# or two lines on stdin, in this order (an empty first line takes the default domain):
-printf '%s\n' "yourcompany.freshdesk.com" "YOUR_KEY" | fd.sh setup
+# or two lines on stdin, in this order: the domain, then the key
+some-command-that-prints-them | fd.sh setup
 ```
 
+There is no `--api-key` flag: a key in the arguments is visible to every process on the machine through `ps`, and stays in the shell history.
 The domain can be given as `yourcompany`, `yourcompany.freshdesk.com` or a full URL.
-Credentials are stored in `${XDG_CONFIG_HOME:-~/.config}/freshdesk/config` with mode `600`.
+A URL is reduced to its host, and a domain carrying a user, a port or a query is refused.
+Credentials are stored in `${XDG_CONFIG_HOME:-~/.config}/freshdesk/config` with mode `600`, in a directory with mode `700`.
 Environment variables of the same name (`FRESHDESK_DOMAIN`, `FRESHDESK_API_KEY`) always take precedence, which is handy in CI.
 
 Verify:
@@ -148,6 +152,12 @@ The list endpoint returns only tickets created in the last 30 days unless asked 
 **The latest conversations are on the last page.** Freshdesk lists a ticket's conversations oldest first, so `ticket` reads every page before taking the tail.
 
 **The API key never reaches argv.** It is handed to `curl` through `--config` on stdin, because command-line arguments are visible to every process on the machine through `ps`.
+
+**The key only travels to your Freshdesk host, over HTTPS.** `curl` runs with `-q`, so nothing in `~/.curlrc` (`insecure`, `proxy`, `location`) applies, with `--proto =https`, and without `-L`, so a redirect is reported as an error and never followed.
+The domain and the key are validated on every run, including when they come from the environment: a domain with `@`, a port or a query, or a key with a quote, is refused before any request.
+
+**Ticket content is untrusted.** Customers write it, so the script strips control characters before printing it, and `SKILL.md` tells the agent to treat it as data and never as instructions.
+A note that contains the API key is refused, so pointing `note-file` at the config file cannot publish it.
 
 **A note is never retried.** Reads retry on transient failures; the POST does not, because a timeout can hide a note that was in fact created.
 When that happens the output says the note may or may not exist, and points at the ticket to check.
