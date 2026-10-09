@@ -16,6 +16,7 @@
 #   CURL_ARGV_LOG     one line per call: every argument, space-separated
 #   CURL_CONFIG_LOG   whatever arrived on stdin through `--config -`
 #   CURL_BODY_DIR     each request payload, as body.<n>.json
+#   CURL_FORM_LOG     one line per multipart field: <flag> <name>=<value>
 #   CURL_ENV_LOG      the environment curl was started with
 #   CURL_FAIL_URLS    substrings; a matching URL exits 7 (connection failure)
 #   CURL_HTTP_STATUS  answer every call with this status ...
@@ -23,7 +24,7 @@
 #   CURL_NOTE_PUBLIC  the created note comes back with "private": false
 set -uo pipefail
 
-method="GET" url="" payload="" wfmt="" config=""
+method="GET" url="" payload="" wfmt="" config="" forms="" files=()
 prev=""
 for arg in "$@"; do
   case "$prev" in
@@ -31,6 +32,10 @@ for arg in "$@"; do
     -d|--data) payload="$arg" ;;
     -w) wfmt="$arg" ;;
     --config|-K) [ "$arg" = "-" ] && config="$(cat)" ;;
+    -F|--form|--form-string)
+      forms="$forms$prev $arg"$'\n'
+      # Only -F reads a file; --form-string sends `@...` as text, as curl does.
+      case "$prev $arg" in "-F attachments[]=@"*) files+=("${arg#"attachments[]=@"}") ;; esac ;;
   esac
   case "$arg" in http://*|https://*) url="$arg" ;; esac
   prev="$arg"
@@ -40,10 +45,16 @@ done
 [ -n "${CURL_ARGV_LOG:-}" ] && echo "$*" >> "$CURL_ARGV_LOG"
 [ -n "${CURL_ENV_LOG:-}" ] && env >> "$CURL_ENV_LOG"
 [ -n "${CURL_CONFIG_LOG:-}" ] && [ -n "$config" ] && printf '%s\n' "$config" >> "$CURL_CONFIG_LOG"
+[ -n "${CURL_FORM_LOG:-}" ] && [ -n "$forms" ] && printf '%s' "$forms" >> "$CURL_FORM_LOG"
 if [ -n "${CURL_BODY_DIR:-}" ] && [ -n "$payload" ]; then
   mkdir -p "$CURL_BODY_DIR"
   printf '%s' "$payload" > "$CURL_BODY_DIR/body.$(ls "$CURL_BODY_DIR" 2>/dev/null | wc -l | tr -d ' ').json"
 fi
+
+# curl gives up with exit 26 when a file to upload cannot be read.
+for f in ${files[@]+"${files[@]}"}; do
+  [ -f "$f" ] && [ -r "$f" ] || exit 26
+done
 
 # Hard failure: simulates a refused connection, which curl reports as exit 7.
 for pat in ${CURL_FAIL_URLS:-}; do
@@ -78,9 +89,16 @@ fi
 [ -f "$fixture" ] || answer 404 ''
 
 if [ "$method" = "POST" ]; then
-  if [ -n "${CURL_NOTE_PUBLIC:-}" ]; then
-    answer 201 "$(jq -c '.private = false' "$fixture")"
+  created="$(cat "$fixture")"
+  # Uploaded files come back as the note's attachments, named as curl names
+  # them: the base name of the path.
+  if [ "${#files[@]}" -gt 0 ]; then
+    created="$(printf '%s\n' "${files[@]}" | jq -R '{name: (split("/") | last)}' \
+      | jq -s --argjson n "$created" '$n + {attachments: .}')"
   fi
-  answer 201 "$(cat "$fixture")"
+  if [ -n "${CURL_NOTE_PUBLIC:-}" ]; then
+    created="$(printf '%s' "$created" | jq -c '.private = false')"
+  fi
+  answer 201 "$created"
 fi
 answer 200 "$(cat "$fixture")"
