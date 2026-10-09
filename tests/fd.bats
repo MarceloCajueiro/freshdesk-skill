@@ -24,6 +24,7 @@ setup() {
   export CURL_ARGV_LOG="$TMP/argv.log"; : > "$CURL_ARGV_LOG"
   export CURL_CONFIG_LOG="$TMP/config.log"; : > "$CURL_CONFIG_LOG"
   export CURL_BODY_DIR="$TMP/bodies"; mkdir -p "$CURL_BODY_DIR"
+  export CURL_FORM_LOG="$TMP/form.log"; : > "$CURL_FORM_LOG"
   export XDG_CONFIG_HOME="$TMP/config"
   mkdir -p "$XDG_CONFIG_HOME/freshdesk"
   printf 'FRESHDESK_DOMAIN=acme.freshdesk.com\nFRESHDESK_API_KEY=FAKEKEY\n' \
@@ -44,6 +45,11 @@ fd() {
 # The JSON payload of the n-th request (0-based) that carried one.
 payload() {
   cat "$CURL_BODY_DIR/body.${1:-0}.json"
+}
+
+# The multipart fields of every request, one per line: "<flag> <name>=<value>".
+forms() {
+  cat "$CURL_FORM_LOG"
 }
 
 # Every request that is not a read, as "METHOD url".
@@ -219,7 +225,9 @@ lookup_snippet() {
 
 @test "the API key never appears in output" {
   local c
-  for c in "whoami" "ticket 123" "search boletim" "search status:2" "note 123 hello"; do
+  printf 'log\n' > "$TMP/a.log"
+  for c in "whoami" "ticket 123" "search boletim" "search status:2" "note 123 hello" \
+           "note 123 hello --attach $TMP/a.log"; do
     # shellcheck disable=SC2086
     fd $c
     [[ "$output" != *"FAKEKEY"* ]]
@@ -534,11 +542,15 @@ lookup_snippet() {
   fd search status:2
   fd note 123 "a"
   fd note-file '#123' "$TMP/n.txt" --notify ana@example.com
+  fd note 123 "b" --attach "$TMP/n.txt"
   [ "$(writes | sort -u)" = "POST https://acme.freshdesk.com/api/v2/tickets/123/notes" ]
+  [ "$(writes | wc -l | tr -d ' ')" -eq 3 ]
   local f
   for f in "$CURL_BODY_DIR"/body.*.json; do
     [ "$(jq -r .private "$f")" = "true" ]
   done
+  [ "$(forms | grep -c '^--form-string private=true$')" -eq 1 ]
+  [ "$(forms | grep -c 'private=')" -eq 1 ]
 }
 
 @test "the HTTP layer refuses every write except a POST to a ticket's notes" {
@@ -564,8 +576,11 @@ lookup_snippet() {
 
 @test "reads are retried, a note is never retried" {
   # A retried POST after a timeout can create the same note twice.
+  printf 'log\n' > "$TMP/a.log"
   fd ticket 123
   fd note 123 "x"
+  fd note 123 "x" --attach "$TMP/a.log"
+  [ "$(grep -c '/notes' "$CURL_ARGV_LOG")" -eq 2 ]
   grep 'agents/me\|tickets/123?include' "$CURL_ARGV_LOG" | grep -q -- '--retry'
   [ "$(grep '/notes' "$CURL_ARGV_LOG" | grep -c -- '--retry')" -eq 0 ]
   grep -q '/notes' "$CURL_ARGV_LOG"
@@ -602,6 +617,223 @@ lookup_snippet() {
 @test "a note to a ticket that does not exist reports 404" {
   fd note 999 "x"
   [[ "$output" == "ERROR: not found (404)"* ]]
+}
+
+# --- note attachments ----------------------------------------------------------
+
+@test "a note without --attach sends the same JSON as before, and no form" {
+  fd note 123 "plain" --notify ana@example.com
+  [ "$status" -eq 0 ]
+  [ "$(payload | jq -c .)" = '{"body":"plain","private":true,"notify_emails":["ana@example.com"]}' ]
+  [ "$(grep -c -- '-H Content-Type: application/json -w' "$CURL_ARGV_LOG")" -eq 1 ]
+  [ ! -s "$CURL_FORM_LOG" ]
+  [ "$output" = "OK: private note 7001 added to ticket #123 - https://acme.freshdesk.com/a/tickets/123" ]
+}
+
+@test "--attach sends a multipart note: private and body as plain strings, the file as a file" {
+  printf 'PNGDATA' > "$TMP/shot.png"
+  fd note 123 "See the screenshot" --attach "$TMP/shot.png"
+  [ "$status" -eq 0 ]
+  [ "$(writes)" = "POST https://acme.freshdesk.com/api/v2/tickets/123/notes" ]
+  [ "$(forms)" = "--form-string body=See the screenshot
+--form-string private=true
+-F attachments[]=@$TMP/shot.png" ]
+  # curl sets the multipart Content-Type, with its boundary; a forced JSON one breaks it.
+  [ "$(grep -c 'Content-Type' "$CURL_ARGV_LOG")" -eq 0 ]
+  [ "$(grep -c -- ' -d ' "$CURL_ARGV_LOG")" -eq 0 ]
+  grep -q -- '--form-string private=true' "$CURL_ARGV_LOG"
+  [ -z "$(ls "$CURL_BODY_DIR")" ]
+  [ "${lines[0]}" = "OK: private note 7001 added to ticket #123 - https://acme.freshdesk.com/a/tickets/123" ]
+  [ "${lines[1]}" = "Attachments (1): shot.png" ]
+  [ "${#lines[@]}" -eq 2 ]
+}
+
+@test "--attach is repeatable, and every file goes in the same note" {
+  printf 'a' > "$TMP/one.png"
+  printf 'b' > "$TMP/two.log"
+  fd note 123 "two files" --attach "$TMP/one.png" --attach "$TMP/two.log"
+  [ "$status" -eq 0 ]
+  [ "$(writes | wc -l | tr -d ' ')" -eq 1 ]
+  [ "$(forms | grep -c '^-F ')" -eq 2 ]
+  forms | grep -qx -- "-F attachments\[\]=@$TMP/one.png"
+  forms | grep -qx -- "-F attachments\[\]=@$TMP/two.log"
+  [ "${lines[1]}" = "Attachments (2): one.png, two.log" ]
+}
+
+@test "note-file takes --attach too, with the body as HTML" {
+  printf 'Line one & <two>\nline 2\n' > "$TMP/note.txt"
+  printf 'x' > "$TMP/report.pdf"
+  fd note-file 123 "$TMP/note.txt" --attach "$TMP/report.pdf"
+  [ "$status" -eq 0 ]
+  forms | grep -qxF -- '--form-string body=Line one &amp; &lt;two&gt;<br>line 2'
+  forms | grep -qxF -- '--form-string private=true'
+  forms | grep -qxF -- "-F attachments[]=@$TMP/report.pdf"
+  [ "${lines[1]}" = "Attachments (1): report.pdf" ]
+}
+
+@test "--notify and --attach together send each email as its own form field" {
+  printf 'x' > "$TMP/a.txt"
+  fd note 123 "heads up" --attach "$TMP/a.txt" --notify ana@example.com --notify bob@example.com
+  [ "$status" -eq 0 ]
+  [ "$(forms | grep -c '^--form-string notify_emails\[\]=')" -eq 2 ]
+  forms | grep -qxF -- '--form-string notify_emails[]=ana@example.com'
+  forms | grep -qxF -- '--form-string notify_emails[]=bob@example.com'
+  forms | grep -qxF -- '--form-string private=true'
+}
+
+@test "a note starting with @ or < is sent as text, never read as a file by curl" {
+  printf 'x' > "$TMP/a.txt"
+  fd note 123 "@/etc/passwd" --attach "$TMP/a.txt"
+  [ "$status" -eq 0 ]
+  forms | grep -qxF -- '--form-string body=@/etc/passwd'
+  fd note 123 "<x" --attach "$TMP/a.txt"
+  forms | grep -qxF -- '--form-string body=&lt;x'
+  # The only field curl reads from disk is the attachment itself.
+  [ "$(forms | grep '^-F ' | grep -vc '^-F attachments\[\]=@')" -eq 0 ]
+}
+
+@test "a relative attachment path is sent as ./path, so a file named - is not stdin" {
+  mkdir -p "$TMP/work"
+  printf 'x' > "$TMP/work/-"
+  printf 'y' > "$TMP/work/r.txt"
+  cd "$TMP/work"
+  fd note 123 "x" --attach - --attach r.txt
+  [ "$status" -eq 0 ]
+  forms | grep -qxF -- '-F attachments[]=@./-'
+  forms | grep -qxF -- '-F attachments[]=@./r.txt'
+}
+
+@test "a file named - or -x is checked for the key like any other, not read as stdin or an option" {
+  mkdir -p "$TMP/work"
+  printf 'FAKEKEY' > "$TMP/work/-"
+  printf 'FAKEKEY' > "$TMP/work/-x.txt"
+  cd "$TMP/work"
+  fd note 123 "x" --attach -
+  [ "$status" -ne 0 ]
+  [ "$output" = "ERROR: the attachment - contains your Freshdesk API key; it was not sent." ]
+  fd note 123 "x" --attach -x.txt
+  [ "$status" -ne 0 ]
+  [ "$output" = "ERROR: the attachment -x.txt contains your Freshdesk API key; it was not sent." ]
+  [ ! -s "$CURL_LOG" ]
+}
+
+@test "an attachment that is missing, empty, unreadable or not a file is refused before any request" {
+  : > "$TMP/empty.bin"
+  printf 'x' > "$TMP/locked.txt"; chmod 000 "$TMP/locked.txt"
+  mkdir -p "$TMP/dir"
+  printf 'x' > "$TMP/ok.txt"
+
+  fd note 123 "x" --attach "$TMP/ok.txt" --attach "$TMP/missing.png"
+  [ "$status" -ne 0 ]
+  [[ "$output" == "ERROR: attachment not found: $TMP/missing.png" ]]
+  fd note 123 "x" --attach "$TMP/empty.bin"
+  [ "$status" -ne 0 ]
+  [[ "$output" == "ERROR: attachment is empty: $TMP/empty.bin" ]]
+  fd note 123 "x" --attach "$TMP/dir"
+  [ "$status" -ne 0 ]
+  [[ "$output" == "ERROR: attachment is not a regular file: $TMP/dir" ]]
+  if [ ! -r "$TMP/locked.txt" ]; then   # root reads anything; the check needs a user that cannot
+    fd note 123 "x" --attach "$TMP/locked.txt"
+    [ "$status" -ne 0 ]
+    [[ "$output" == "ERROR: attachment is not readable: $TMP/locked.txt" ]]
+  fi
+  fd note 123 "x" --attach
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"--attach needs a file"* ]]
+  chmod 600 "$TMP/locked.txt"
+  [ ! -s "$CURL_LOG" ]
+}
+
+@test "an attachment path curl's -F syntax would misread is refused, with a way out" {
+  local name
+  for name in 'a;type=text.txt' 'a,b.txt' 'a"b.txt' $'a\nb.txt' 'a\b.txt'; do
+    printf 'x' > "$TMP/$name"
+    fd note 123 "x" --attach "$TMP/$name"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Copy or rename the file"* ]]
+    [ "${#lines[@]}" -eq 1 ]   # a line break in the name is not echoed raw
+  done
+  [ ! -s "$CURL_LOG" ]
+}
+
+@test "the skill's own config file cannot be attached, directly or through a link" {
+  fd note 123 "x" --attach "$XDG_CONFIG_HOME/freshdesk/config"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"credentials file"* ]]
+  ln -s "$XDG_CONFIG_HOME/freshdesk/config" "$TMP/innocent.txt"
+  fd note 123 "x" --attach "$TMP/innocent.txt"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"credentials file"* ]]
+  # The file holds another key than the one in use: identity, not content, refuses it.
+  run env FRESHDESK_API_KEY=ENVKEY "$FD_BASH" "$FD" note 123 "x" --attach "$XDG_CONFIG_HOME/freshdesk/config"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"credentials file"* ]]
+  [[ "$output" != *"FAKEKEY"* ]]
+  [ ! -s "$CURL_LOG" ]
+}
+
+@test "an attachment that contains the API key is refused, text or binary" {
+  printf 'export FRESHDESK_API_KEY=FAKEKEY\n' > "$TMP/env.sh"
+  printf 'PK\000\001\377FAKEKEY\000\002' > "$TMP/blob.bin"
+  printf 'x' > "$TMP/ok.txt"
+  local f
+  for f in "$TMP/env.sh" "$TMP/blob.bin"; do
+    fd note 123 "x" --attach "$TMP/ok.txt" --attach "$f"
+    [ "$status" -ne 0 ]
+    [[ "$output" == "ERROR: the attachment $f contains your Freshdesk API key; it was not sent." ]]
+  done
+  [ ! -s "$CURL_LOG" ]
+}
+
+@test "attachments adding up to more than 20 MB are refused, and the limit is called ticket-wide" {
+  # Sparse files: 22 MB as far as the size goes, no disk or time spent on it.
+  dd if=/dev/zero of="$TMP/half1.bin" bs=1048576 seek=11 count=0 2>/dev/null
+  dd if=/dev/zero of="$TMP/half2.bin" bs=1048576 seek=11 count=0 2>/dev/null
+  fd note 123 "x" --attach "$TMP/half1.bin"
+  [ "$status" -eq 0 ]   # each one alone fits
+  : > "$CURL_LOG"
+  fd note 123 "x" --attach "$TMP/half1.bin" --attach "$TMP/half2.bin"
+  [ "$status" -ne 0 ]
+  [[ "$output" == "ERROR: the attachments add up to 22.0 MB, over Freshdesk's 20 MB."* ]]
+  [[ "$output" == *"all of a ticket's attachments together"* ]]
+  [[ "$output" == *"Nothing was sent."* ]]
+  [ ! -s "$CURL_LOG" ]
+}
+
+@test "a size refusal from Freshdesk points at the ticket-wide limit" {
+  printf 'x' > "$TMP/a.txt"
+  CURL_HTTP_STATUS=413 CURL_HTTP_BODY='<html>Request Entity Too Large</html>' fd note 123 "x" --attach "$TMP/a.txt"
+  [[ "$output" == "ERROR: request too large (413)"*"cannot exceed 20 MB, counting those already on it"* ]]
+  CURL_HTTP_STATUS=400 CURL_HTTP_BODY='{"description":"Validation failed","errors":[{"field":"attachments","message":"It should not be more than 20MB","code":"invalid_size"}]}' \
+    fd note 123 "x" --attach "$TMP/a.txt"
+  [[ "$output" == "ERROR: HTTP 400: Validation failed; attachments: It should not be more than 20MB."*"counting those already on it"* ]]
+  # A 400 about something else keeps its own message.
+  CURL_HTTP_STATUS=400 CURL_HTTP_BODY='{"description":"Validation failed","errors":[{"field":"notify_emails","message":"Invalid agent"}]}' \
+    fd note 123 "x" --attach "$TMP/a.txt"
+  [ "$output" = "ERROR: HTTP 400: Validation failed; notify_emails: Invalid agent" ]
+}
+
+@test "a network failure on a note with attachments is not reported as a clean failure" {
+  printf 'x' > "$TMP/a.txt"
+  CURL_FAIL_URLS="notes" fd note 123 "x" --attach "$TMP/a.txt"
+  [[ "$output" == *"may or may not have been created"* ]]
+  [ "$(grep -c 'notes' "$CURL_LOG")" -eq 1 ]
+}
+
+@test "a note with attachments that Freshdesk stored as public is reported loudly" {
+  printf 'x' > "$TMP/a.txt"
+  CURL_NOTE_PUBLIC=1 fd note 123 "x" --attach "$TMP/a.txt"
+  [ "$status" -ne 0 ]
+  [[ "$output" == "ERROR: Freshdesk stored note 7001 as PUBLIC"* ]]
+}
+
+@test "fewer attachments on the created note than were sent is a warning" {
+  printf 'x' > "$TMP/a.txt"
+  printf 'y' > "$TMP/b.txt"
+  CURL_HTTP_STATUS=201 CURL_HTTP_BODY='{"id":7002,"private":true,"attachments":[{"name":"a.txt"}]}' \
+    fd note 123 "x" --attach "$TMP/a.txt" --attach "$TMP/b.txt"
+  [ "${lines[1]}" = "Attachments (1): a.txt" ]
+  [[ "${lines[2]}" == "WARNING: 2 file(s) sent, but Freshdesk lists 1 on the note."* ]]
 }
 
 # --- the lookup snippet documented in SKILL.md ------------------------------

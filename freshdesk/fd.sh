@@ -216,6 +216,17 @@ fd_curl() {
   local retry=()
   [ "$method" = "GET" ] && retry=(--retry 2 --retry-connrefused)
 
+  # A form field among the arguments makes it a multipart upload. curl writes
+  # that Content-Type itself, with the boundary the body is cut by; a JSON one
+  # forced on top would leave Freshdesk unable to parse the request. Uploads
+  # get a longer timeout: 20 MB on a slow link takes more than 20 seconds.
+  local ctype=(-H "Content-Type: application/json") timeout="${FD_HTTP_TIMEOUT:-20}" a
+  for a in "$@"; do
+    case "$a" in
+      -F|--form|--form-string) ctype=(); timeout="${FD_UPLOAD_TIMEOUT:-120}"; break ;;
+    esac
+  done
+
   # The key goes in through --config on stdin, never as an argument: argv is
   # readable by every process on the machine through `ps`.
   # -q, first, skips ~/.curlrc, so no `insecure`, `location` or `proxy` set there
@@ -224,8 +235,8 @@ fd_curl() {
   # -X and the URL come after the caller's arguments, so they always win.
   local out
   if ! out=$(printf 'user = "%s:X"\n' "$FRESHDESK_API_KEY" \
-      | curl -q -sS --config - --proto =https --max-time "${FD_HTTP_TIMEOUT:-20}" ${retry[@]+"${retry[@]}"} \
-          -H "Content-Type: application/json" \
+      | curl -q -sS --config - --proto =https --max-time "$timeout" ${retry[@]+"${retry[@]}"} \
+          ${ctype[@]+"${ctype[@]}"} \
           -w '\n%{http_code}' \
           "$@" \
           -X "$method" "$BASE$path" 2>/dev/null); then
@@ -254,6 +265,7 @@ fd_error() {
     401) echo "ERROR: invalid API key (401). Run 'fd.sh setup' again with a current key." ;;
     403) echo "ERROR: forbidden (403): this agent has no access to that $what${detail:+ - $detail}" ;;
     404) echo "ERROR: not found (404): no such $what, or this agent cannot see it" ;;
+    413) echo "ERROR: request too large (413): Freshdesk refused the size of what was sent" ;;
     429) echo "ERROR: rate limited (429): the account's API quota is spent for now; wait a minute and retry" ;;
     *)   echo "ERROR: HTTP $status${detail:+: $detail}" ;;
   esac
@@ -431,10 +443,71 @@ FD_JQ_HTML='
   | gsub("\r?\n"; "<br>")
 '
 
-# Internal: posts a private note. $1 ticket arg, $2 text, rest: notify emails.
+# Freshdesk caps the attachments of a whole ticket at 20 MB, not those of one
+# note: files already on the ticket count against the same limit.
+FD_ATTACH_MAX_BYTES=$((20 * 1024 * 1024))
+
+# Internal: checks every file in FD_ATTACH before anything is sent, and prints
+# one ERROR line for the first that cannot go. An attachment is read by every
+# agent on the ticket, so the checks guard what leaves this machine as much as
+# what curl is able to upload.
+fd_check_attachments() {
+  local f shown size total=0 rc
+  for f in ${FD_ATTACH[@]+"${FD_ATTACH[@]}"}; do
+    # The path is echoed back with control characters replaced: a line break or
+    # an escape sequence in it must not reach the terminal raw.
+    shown=$(printf '%s' "$f" | tr '[:cntrl:]' '?')
+    # curl -F reads `;` as the start of `type=` or `filename=`, `,` as a list of
+    # files and `"` or `\` as quoting, so such a path uploads something else, or
+    # nothing. Escaping it is fragile across curl versions; a plain name is not.
+    case "$f" in
+      *[\;,\"\\]*|*[[:cntrl:]]*)
+        echo "ERROR: the attachment path has a character curl cannot upload from (; , \" \\ or a line break): $shown. Copy or rename the file to a plain name and attach that."
+        return 1 ;;
+    esac
+    [ -e "$f" ] || { echo "ERROR: attachment not found: $shown"; return 1; }
+    [ -f "$f" ] || { echo "ERROR: attachment is not a regular file: $shown"; return 1; }
+    [ -r "$f" ] || { echo "ERROR: attachment is not readable: $shown"; return 1; }
+    [ -s "$f" ] || { echo "ERROR: attachment is empty: $shown"; return 1; }
+    # Refused by identity, not only by content: a key from the environment wins
+    # over the file's, so the file can hold another key the content check below
+    # does not look for. -ef follows symlinks and sees through `..` paths.
+    if [ "$f" -ef "$CONFIG_FILE" ]; then
+      echo "ERROR: $shown is this skill's credentials file; it was not sent."
+      return 1
+    fi
+    # wc pads its number with spaces on BSD; the arithmetic drops them.
+    size=$(( $(wc -c < "$f") ))
+    total=$((total + size))
+  done
+
+  if [ "$total" -gt "$FD_ATTACH_MAX_BYTES" ]; then
+    echo "ERROR: the attachments add up to $(awk -v b="$total" 'BEGIN { printf "%.1f", b / 1048576 }') MB, over Freshdesk's 20 MB. That limit is for all of a ticket's attachments together, so even less can be refused when the ticket already has some. Nothing was sent."
+    return 1
+  fi
+
+  # Last, because it reads every byte. The key reaches grep on stdin, never as
+  # an argument, where `ps` would show it. -a reads a binary file as text
+  # instead of skipping it, and a file grep cannot read is refused, not sent.
+  # A relative path gets ./ in front, as it does when sent: to grep, a file
+  # named `-` is the stdin the key was just read from, and `-x` is an option.
+  for f in ${FD_ATTACH[@]+"${FD_ATTACH[@]}"}; do
+    shown=$(printf '%s' "$f" | tr '[:cntrl:]' '?')
+    case "$f" in /*) ;; *) f="./$f" ;; esac
+    rc=0
+    printf '%s\n' "$FRESHDESK_API_KEY" | LC_ALL=C grep -qaF -f - "$f" || rc=$?
+    case "$rc" in
+      1) ;;
+      0) echo "ERROR: the attachment $shown contains your Freshdesk API key; it was not sent."; return 1 ;;
+      *) echo "ERROR: could not read the attachment: $shown"; return 1 ;;
+    esac
+  done
+}
+
+# Internal: posts a private note. $1 ticket arg, $2 text. The agents to notify
+# and the files to attach come from fd_note_args, in FD_NOTIFY and FD_ATTACH.
 fd_post_note() {
   local arg="$1" text="$2"
-  shift 2
   local id
   id=$(fd_ticket_id "$arg")
   [ -n "$id" ] || { echo "ERROR: not a ticket id or ticket link: $arg"; return 1; }
@@ -445,28 +518,68 @@ fd_post_note() {
     *"$FRESHDESK_API_KEY"*) echo "ERROR: the note contains your Freshdesk API key; it was not sent."; return 1 ;;
   esac
 
-  local emails='[]' e
-  for e in "$@"; do
+  local e
+  for e in ${FD_NOTIFY[@]+"${FD_NOTIFY[@]}"}; do
     case "$e" in
-      *@*.*) emails=$(jq -n --argjson a "$emails" --arg e "$e" '$a + [$e]') ;;
+      *@*.*) ;;
       *) echo "ERROR: not an email address: $e"; return 1 ;;
     esac
   done
 
-  # `private: true` is a literal: no argument, flag or variable can reach it.
-  local payload
-  payload=$(jq -n --arg t "$text" --argjson n "$emails" "
-    {body: (\$t | $FD_JQ_HTML), private: true}
-    + (if (\$n | length) > 0 then {notify_emails: \$n} else {} end)")
+  local nattach=${#FD_ATTACH[@]}
+  if [ "$nattach" -gt 0 ]; then
+    fd_check_attachments || return 1
+  fi
 
-  local res status body
-  res=$(fd_curl POST "/api/v2/tickets/$id/notes" -d "$payload")
+  # `private` is a literal in both forms of the request: no argument, flag or
+  # variable can reach it.
+  local req=()
+  if [ "$nattach" -eq 0 ]; then
+    local emails='[]' payload
+    for e in ${FD_NOTIFY[@]+"${FD_NOTIFY[@]}"}; do
+      emails=$(jq -n --argjson a "$emails" --arg e "$e" '$a + [$e]')
+    done
+    payload=$(jq -n --arg t "$text" --argjson n "$emails" "
+      {body: (\$t | $FD_JQ_HTML), private: true}
+      + (if (\$n | length) > 0 then {notify_emails: \$n} else {} end)")
+    req=(-d "$payload")
+  else
+    # Files go as multipart/form-data, the only form the API takes them in.
+    # Every value that is not a file goes through --form-string, which sends it
+    # as is: with -F, a note starting with `@` or `<` would have curl read a
+    # file from this machine into the note.
+    local html f
+    html=$(jq -rn --arg t "$text" "\$t | $FD_JQ_HTML")
+    req=(--form-string "body=$html" --form-string "private=true")
+    for e in ${FD_NOTIFY[@]+"${FD_NOTIFY[@]}"}; do
+      req+=(--form-string "notify_emails[]=$e")
+    done
+    for f in "${FD_ATTACH[@]}"; do
+      # A file named `-` would be `@-`, which curl reads from stdin instead.
+      case "$f" in /*) ;; *) f="./$f" ;; esac
+      req+=(-F "attachments[]=@$f")
+    done
+  fi
+
+  local res status body msg
+  res=$(fd_curl POST "/api/v2/tickets/$id/notes" "${req[@]}")
   status=$(fd_status "$res")
   body=$(fd_body "$res")
   case "$status" in
     200|201) ;;
     000) echo "ERROR: network failure talking to Freshdesk ($BASE). The note may or may not have been created: check $(fd_ticket_link "$id") before sending again."; return 0 ;;
-    *) fd_error "$status" "$body" "ticket"; return 0 ;;
+    *)
+      msg=$(fd_error "$status" "$body" "ticket")
+      # Only the API knows what the ticket already holds, so the local 20 MB
+      # check cannot rule this out.
+      if [ "$nattach" -gt 0 ]; then
+        case "$status:$msg" in
+          413:*|400:*[Aa]ttachment*)
+            msg="$msg. All of a ticket's attachments together cannot exceed 20 MB, counting those already on it: send fewer or smaller files, or link to them instead." ;;
+        esac
+      fi
+      printf '%s\n' "$msg"
+      return 0 ;;
   esac
 
   local nid private
@@ -477,34 +590,49 @@ fd_post_note() {
     return 1
   fi
   echo "OK: private note ${nid:-?} added to ticket #$id - $(fd_ticket_link "$id")"
+
+  [ "$nattach" -gt 0 ] || return 0
+  # The names come from Freshdesk, not from the arguments: they are what the
+  # ticket actually holds.
+  local got names
+  got=$(printf '%s' "$body" | jq -r '(.attachments // []) | length' 2>/dev/null || echo 0)
+  names=$(printf '%s' "$body" | jq -r "$FD_JQ_DEFS"'
+    [(.attachments // [])[] | (.name // "?") | tostring | oneline] | join(", ")' 2>/dev/null || true)
+  echo "Attachments ($got): ${names:--}"
+  if [ "$got" != "$nattach" ]; then
+    echo "WARNING: $nattach file(s) sent, but Freshdesk lists $got on the note. Check $(fd_ticket_link "$id")."
+  fi
 }
 
-# Internal: parses `[--notify email]...` after the positional arguments.
-# Anything else is refused, including every attempt at a public note.
+# Internal: parses `[--notify email]... [--attach file]...` after the positional
+# arguments. Anything else is refused, including every attempt at a public note.
 fd_note_args() {
   FD_NOTIFY=()
+  FD_ATTACH=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --notify) [ -n "${2:-}" ] || { echo "ERROR: --notify needs an email address"; return 1; }
                 FD_NOTIFY+=("$2"); shift 2 ;;
+      --attach) [ -n "${2:-}" ] || { echo "ERROR: --attach needs a file"; return 1; }
+                FD_ATTACH+=("$2"); shift 2 ;;
       *) echo "ERROR: unknown option: $1. Notes are always private; this skill cannot reply to a customer or post a public note."; return 1 ;;
     esac
   done
 }
 
-# note <ticket> <text> [--notify email]...
+# note <ticket> <text> [--notify email]... [--attach file]...
 cmd_note() {
-  local usage="usage: fd.sh note <ticket> <text> [--notify agent@example.com]..."
+  local usage="usage: fd.sh note <ticket> <text> [--notify agent@example.com]... [--attach file]..."
   [ $# -ge 2 ] || { echo "$usage" >&2; return 1; }
   local ticket="$1" text="$2"
   shift 2
   fd_note_args "$@" || return 1
-  fd_post_note "$ticket" "$text" ${FD_NOTIFY[@]+"${FD_NOTIFY[@]}"}
+  fd_post_note "$ticket" "$text"
 }
 
-# note-file <ticket> <file> [--notify email]... - the text comes from a file
+# note-file <ticket> <file> [--notify email]... [--attach file]... - the text comes from a file
 cmd_note_file() {
-  local usage="usage: fd.sh note-file <ticket> <file> [--notify agent@example.com]..."
+  local usage="usage: fd.sh note-file <ticket> <file> [--notify agent@example.com]... [--attach file]..."
   [ $# -ge 2 ] || { echo "$usage" >&2; return 1; }
   local ticket="$1" file="$2"
   shift 2
@@ -514,7 +642,7 @@ cmd_note_file() {
   [ -s "$file" ] || { echo "ERROR: note file is empty: $file"; return 1; }
   local text
   text=$(cat "$file") || { echo "ERROR: could not read the note file: $file"; return 1; }
-  fd_post_note "$ticket" "$text" ${FD_NOTIFY[@]+"${FD_NOTIFY[@]}"}
+  fd_post_note "$ticket" "$text"
 }
 
 # Sourced (by the test suite, to reach fd_curl directly): define, do not run.
@@ -527,7 +655,7 @@ case "${1:-}" in
   search)    shift; cmd_search "$@" ;;
   note)      shift; cmd_note "$@" ;;
   note-file) shift; cmd_note_file "$@" ;;
-  *) echo "usage: fd.sh {setup|whoami|ticket <id|url>|search <words|filter-query> [count]|note <ticket> <text> [--notify email]...|note-file <ticket> <file> [--notify email]...}" >&2
+  *) echo "usage: fd.sh {setup|whoami|ticket <id|url>|search <words|filter-query> [count]|note <ticket> <text> [--notify email]... [--attach file]...|note-file <ticket> <file> [--notify email]... [--attach file]...}" >&2
      echo "Read-only, plus private notes. There is no reply, public note or ticket update, by design." >&2
      exit 1 ;;
 esac

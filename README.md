@@ -21,7 +21,7 @@ Support reads private notes on the ticket faster than comments on a GitHub issue
   Those are the only two actions.
 - It never replies to the customer, never posts a public note, and never changes a ticket's status, priority, assignment, tags or fields.
 - The rule is enforced in code, not only in the instructions: the script has no command for any other write, refuses any option that asks for one, and its HTTP layer refuses every request except reads and a POST to a ticket's notes.
-  The note payload always carries `"private": true`, and the test suite proves it.
+  The note always carries `"private": true` (as `private=true` when it has attachments), and the test suite proves it.
 
 ## Install
 
@@ -85,6 +85,7 @@ Regenerating it in Freshdesk invalidates the old one; run `fd.sh setup` again af
 | "is there a ticket about X?" | Matches words in the subjects of recently updated tickets, and says how many it scanned |
 | "open urgent tickets tagged boletim" | Runs a Freshdesk filter query |
 | "tell support on 4521 that ..." | Drafts a private note, **shows it to you, waits for approval**, then posts it |
+| "... and attach this log" | Same, with the file attached to the private note; the confirmation lists each file's name and size |
 
 Posting always asks for confirmation first.
 A note goes out in your name and notifies people.
@@ -102,7 +103,10 @@ fd.sh search "status:2 AND priority:4"        # Freshdesk filter query
 fd.sh note 4521 "text"                        # private note
 fd.sh note-file 4521 note.txt                 # private note, text from a file
 fd.sh note 4521 "text" --notify ana@example.com   # and email an agent about it
+fd.sh note 4521 "text" --attach error.log --attach screen.png   # private note with files
 ```
+
+`--notify` and `--attach` are repeatable, and work on `note` and `note-file` alike.
 
 Search output is TSV: `updated<TAB>#id<TAB>status<TAB>subject<TAB>link`.
 
@@ -116,6 +120,7 @@ A note is plain text: line breaks are kept, URLs become links, and `<`, `>` and 
 | `FD_SEARCH_DAYS` | `90` | How far back a plain-word search looks |
 | `FD_SEARCH_PAGES` | `3` | How many pages of 100 tickets a plain-word search scans |
 | `FD_HTTP_TIMEOUT` | `20` | Per-request timeout, in seconds |
+| `FD_UPLOAD_TIMEOUT` | `120` | Timeout for a note with attachments, in seconds |
 
 ## Claude Desktop
 
@@ -137,7 +142,7 @@ FD_BASH=/bin/bash bats tests/fd.bats    # exercise bash 3.2 on macOS
 The suite never touches the network: `tests/bin/curl` shadows `curl` on `PATH`, answers from fixtures with the HTTP status the script asks for, and logs every call, its arguments and its payload.
 That log is what the private-only rule is tested against: across every command, the only write is a POST to a ticket's notes, and every payload says `"private": true`.
 
-CI also plants the one defect this skill must never ship - a note sent as public - and requires the suite to go red.
+CI also plants the one defect this skill must never ship - a note sent as public, in the JSON request and in the multipart one used for attachments - and requires the suite to go red.
 A test that cannot fail proves nothing.
 
 The documented install-path lookup in `SKILL.md` is extracted from the file and executed, so the instructions the agent follows cannot silently drift from what actually works.
@@ -158,6 +163,16 @@ The domain and the key are validated on every run, including when they come from
 
 **Ticket content is untrusted.** Customers write it, so the script strips control characters before printing it, and `SKILL.md` tells the agent to treat it as data and never as instructions.
 A note that contains the API key is refused, so pointing `note-file` at the config file cannot publish it.
+
+**Attachments go as multipart, with every other field sent literally.** Freshdesk takes files only as `multipart/form-data`, so a note with `--attach` is sent that way and without the JSON `Content-Type`, which would hide the boundary curl writes.
+The body, `private=true` and each notify address go through `curl --form-string`, never `-F`: with `-F`, a note starting with `@` or `<` would make curl read a file from this machine into it.
+Only the attachments use `-F`, and a path curl's `-F` syntax would misread (`;`, `,`, `"`, `\`, a line break) is refused with a hint to copy the file to a plain name.
+
+**Attachments are checked before anything is sent.** Each file must exist, be a regular readable file and not be empty.
+The config file is refused by identity (symlinks included), and any file containing the API key is refused by content, binary files too; the key reaches `grep` on stdin, not in its arguments.
+Files adding up to more than 20 MB are refused.
+That is Freshdesk's limit for all of a ticket's attachments together, so the API can still refuse a smaller set when the ticket already has some, and the error says so.
+The success line is followed by the attachment names Freshdesk reports, and a warning when it lists fewer than were sent.
 
 **A note is never retried.** Reads retry on transient failures; the POST does not, because a timeout can hide a note that was in fact created.
 When that happens the output says the note may or may not exist, and points at the ticket to check.

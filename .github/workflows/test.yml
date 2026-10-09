@@ -47,17 +47,20 @@ jobs:
 
       - name: Suite must catch a note sent as public
         # A suite that cannot fail proves nothing. The one defect this skill must
-        # never ship is a public note, so CI plants it and expects red.
+        # never ship is a public note, so CI plants it and expects red - once in
+        # the JSON payload and once in the multipart form a note with files uses.
         run: |
-          sed 's/private: true}/private: false}/' freshdesk/fd.sh > /tmp/public_fd.sh
-          if cmp -s freshdesk/fd.sh /tmp/public_fd.sh; then
-            echo "The mutation did not apply: the note payload changed shape. Update this step."
-            exit 1
-          fi
-          if FD=/tmp/public_fd.sh bats tests/fd.bats > /tmp/public.log 2>&1; then
-            echo "The suite passed with notes sent as public - it has no power to fail."
-            cat /tmp/public.log
-            exit 1
-          fi
-          echo "Failures with notes sent as public, as expected:"
-          grep -c '^not ok' /tmp/public.log
+          for mutation in 's/private: true}/private: false}/' 's/private=true/private=false/'; do
+            sed "$mutation" freshdesk/fd.sh > /tmp/public_fd.sh
+            if cmp -s freshdesk/fd.sh /tmp/public_fd.sh; then
+              echo "The mutation '$mutation' did not apply: the note request changed shape. Update this step."
+              exit 1
+            fi
+            if FD=/tmp/public_fd.sh bats tests/fd.bats > /tmp/public.log 2>&1; then
+              echo "The suite passed with '$mutation' - it has no power to fail."
+              cat /tmp/public.log
+              exit 1
+            fi
+            echo "Failures with '$mutation', as expected:"
+            grep -c '^not ok' /tmp/public.log
+          done
