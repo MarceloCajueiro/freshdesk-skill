@@ -1,0 +1,8 @@
+[
+ {"id":8000,"body_text":"Segue a exportacao pedida.","incoming":true,"private":false,"source":0,"user_id":502,"from_email":"joao@escola.example.org","ticket_id":124,"attachments":[],"created_at":"2026-10-04T08:00:00Z"},
+ {"id":8001,"body":"<div>Arquivos do diario anexados.</div>","body_text":"Arquivos do diario anexados.\nSenha em seguida.","incoming":false,"private":true,"source":2,"user_id":9001,"ticket_id":124,"attachments":[{"id":1,"name":"diario.zip"},{"id":2,"name":"notas.zip"}],"created_at":"2026-10-05T09:00:00Z"},
+ {"id":8002,"body_text":"Nota publica minha.","incoming":false,"private":false,"source":2,"user_id":9001,"ticket_id":124,"attachments":[],"created_at":"2026-10-05T10:00:00Z"},
+ {"id":8003,"body_text":"Nota privada de outro agente.","incoming":false,"private":true,"source":2,"user_id":9002,"ticket_id":124,"attachments":[],"created_at":"2026-10-05T11:00:00Z"},
+ {"id":8004,"body_text":"Resposta minha ao cliente.","incoming":false,"private":false,"source":0,"user_id":9001,"from_email":"suporte@example.com","ticket_id":124,"attachments":[],"created_at":"2026-10-05T12:00:00Z"},
+ {"id":8005,"body_text":"Nota privada sem anexos.","incoming":false,"private":true,"source":2,"user_id":9001,"ticket_id":124,"attachments":[],"last_edited_at":"2026-10-06T08:00:00Z","created_at":"2026-10-05T13:00:00Z"}
+]

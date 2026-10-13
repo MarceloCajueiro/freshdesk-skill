@@ -4,9 +4,10 @@
 # ${XDG_CONFIG_HOME:-~/.config}/freshdesk/config with mode 600.
 # Environment variables of the same name always win over the config file.
 #
-# HARD RULE: this script reads tickets and adds PRIVATE notes. Nothing else.
-# It never replies to a customer, never posts a public note, and never changes
-# a ticket's status, assignment or fields. fd_curl enforces that for every call.
+# HARD RULE: this script reads tickets, adds PRIVATE notes and edits the text of
+# a private note the key's own agent wrote. Nothing else. It never replies to a
+# customer, never posts or makes a note public, and never changes a ticket's
+# status, assignment or fields. fd_curl enforces that for every call.
 set -euo pipefail
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/freshdesk"
@@ -194,8 +195,9 @@ fi
 # blocked the call).
 #
 # The allowlist below is the hard rule in code: GET anything under /api/v2/,
-# POST only to a ticket's notes. Reply, update, assign, delete and every other
-# write are refused here, before curl runs, whatever the caller asked for.
+# POST only to a ticket's notes, and PUT only the body of the one note
+# fd_check_own_note cleared. Reply, update, assign, delete and every other write
+# are refused here, before curl runs, whatever the caller asked for.
 fd_curl() {
   local method="$1" path="$2"
   shift 2
@@ -208,11 +210,24 @@ fd_curl() {
         ""|*[!0-9]*) printf '%s %s\nrefused\n' "$method" "$path"; return 0 ;;
       esac
       ;;
+    "PUT /api/v2/conversations/"*)
+      # The endpoint takes a body and new attachments, nothing else. A JSON
+      # object holding only `body` can neither make the note public nor touch
+      # the files already on it; any other shape is refused.
+      local cid="${path#/api/v2/conversations/}"
+      case "$cid" in
+        ""|*[!0-9]*) printf '%s %s\nrefused\n' "$method" "$path"; return 0 ;;
+      esac
+      if [ "$cid" != "${FD_EDITABLE_NOTE:-}" ] || [ $# -ne 2 ] || [ "$1" != "-d" ] ||
+         ! printf '%s' "$2" | jq -e 'type == "object" and keys == ["body"] and (.body | type) == "string"' >/dev/null 2>&1; then
+        printf '%s %s\nrefused\n' "$method" "$path"; return 0
+      fi
+      ;;
     *) printf '%s %s\nrefused\n' "$method" "$path"; return 0 ;;
   esac
 
-  # A timeout on a POST may hide a note that was in fact created: retrying it
-  # could post the same note twice. Only reads are retried.
+  # A timeout on a write may hide a note that was in fact created or changed:
+  # retrying a POST could post the same note twice. Only reads are retried.
   local retry=()
   [ "$method" = "GET" ] && retry=(--retry 2 --retry-connrefused)
 
@@ -260,7 +275,7 @@ fd_error() {
         ((.errors // [])[] | "\(.field // "?"): \(.message // .code // "?")") ]
       | map(select(type == "string" and . != "")) | join("; ")' 2>/dev/null || true)
   case "$status" in
-    refused) echo "ERROR: refused by this skill: $body. It only reads tickets and adds private notes." ;;
+    refused) echo "ERROR: refused by this skill: $body. It only reads tickets, adds private notes and edits your own private notes." ;;
     000) echo "ERROR: network failure talking to Freshdesk ($BASE)" ;;
     401) echo "ERROR: invalid API key (401). Run 'fd.sh setup' again with a current key." ;;
     403) echo "ERROR: forbidden (403): this agent has no access to that $what${detail:+ - $detail}" ;;
@@ -316,9 +331,50 @@ FD_JQ_DEFS='
   def scrub: if type == "string" then gsub("[[:cntrl:]]+"; " ")
              elif type == "object" then map_values(scrub)
              elif type == "array" then map(scrub) else . end;
+  def scrub_lines: gsub("\r\n?"; "\n") | gsub("[^\\n[:^cntrl:]]+"; " ");
+  def kind: if .private == true then "PRIVATE NOTE"
+            elif .source == 2 then "PUBLIC NOTE"
+            elif .incoming == true then "PUBLIC, from customer"
+            else "PUBLIC REPLY" end;
   def oneline: gsub("[[:cntrl:]]+"; " ") | gsub("  +"; " ") | ltrimstr(" ") | rtrimstr(" ");
   def clip($n): if length > $n then .[0:$n] + " [...]" else . end;
 '
+
+# Internal: every conversation of a ticket, oldest first, as one JSON array, or
+# one ERROR line. They come a page at a time and the most recent ones are on the
+# last page, so every page is read until a short one ends the list, up to
+# FD_CONVERSATION_PAGES pages of FD_CONVERSATIONS_PER_PAGE.
+FD_CONVERSATIONS_PER_PAGE=100
+fd_conversations() {
+  local id="$1" per="$FD_CONVERSATIONS_PER_PAGE" page=1 all='[]' chunk n
+  while [ "$page" -le "${FD_CONVERSATION_PAGES:-10}" ]; do
+    chunk=$(fd_get "/api/v2/tickets/$id/conversations?per_page=$per&page=$page" "ticket")
+    case "$chunk" in ERROR:*) printf '%s\n' "$chunk"; return 0 ;; esac
+    all=$(jq -n --argjson a "$all" --argjson b "$chunk" '$a + $b')
+    n=$(printf '%s' "$chunk" | jq 'length')
+    [ "$n" -lt "$per" ] && break
+    page=$((page + 1))
+  done
+  printf '%s' "$all"
+}
+
+# Internal: true when a ticket's conversations filled every page read, so more
+# may exist beyond them. $1 is the array fd_conversations printed.
+fd_conversations_capped() {
+  [ "$(printf '%s' "$1" | jq 'length')" -ge $(( ${FD_CONVERSATION_PAGES:-10} * FD_CONVERSATIONS_PER_PAGE )) ]
+}
+
+# Internal: the id of the agent the API key belongs to, or one ERROR line.
+fd_my_id() {
+  local me myid
+  me=$(fd_get "/api/v2/agents/me" "agent")
+  case "$me" in ERROR:*) printf '%s\n' "$me"; return 0 ;; esac
+  myid=$(printf '%s' "$me" | jq -r '.id // empty')
+  case "$myid" in
+    ""|*[!0-9]*) echo "ERROR: Freshdesk did not say which agent this API key belongs to" ;;
+    *) printf '%s' "$myid" ;;
+  esac
+}
 
 cmd_whoami() {
   local body
@@ -338,17 +394,9 @@ cmd_ticket() {
   ticket=$(fd_get "/api/v2/tickets/$id?include=requester,company" "ticket")
   case "$ticket" in ERROR:*) printf '%s\n' "$ticket"; return 0 ;; esac
 
-  # Conversations come oldest first, a page at a time. The most recent ones are
-  # on the last page, so every page is read until a short one ends the list.
-  local per=100 page=1 all='[]' chunk n
-  while [ "$page" -le "${FD_CONVERSATION_PAGES:-10}" ]; do
-    chunk=$(fd_get "/api/v2/tickets/$id/conversations?per_page=$per&page=$page" "ticket")
-    case "$chunk" in ERROR:*) printf '%s\n' "$chunk"; return 0 ;; esac
-    all=$(jq -n --argjson a "$all" --argjson b "$chunk" '$a + $b')
-    n=$(printf '%s' "$chunk" | jq 'length')
-    [ "$n" -lt "$per" ] && break
-    page=$((page + 1))
-  done
+  local all
+  all=$(fd_conversations "$id")
+  case "$all" in ERROR:*) printf '%s\n' "$all"; return 0 ;; esac
 
   printf '%s' "$ticket" | jq -r --arg link "$(fd_ticket_link "$id")" \
     --argjson convs "$all" --argjson last "${FD_CONVERSATIONS:-5}" "$FD_JQ_DEFS"'
@@ -367,10 +415,7 @@ cmd_ticket() {
      | if $total == 0 then "Conversations: none"
        else "Conversations (last \([$total, $last] | min) of \($total), oldest first):",
          ($convs[-$last:][]
-          | (if .private == true then "PRIVATE NOTE"
-             elif .source == 2 then "PUBLIC NOTE"
-             elif .incoming == true then "PUBLIC, from customer"
-             else "PUBLIC REPLY" end) as $kind
+          | kind as $kind
           | "\(.created_at | day)\t\($kind)\t\(.from_email // "user \(.user_id // "?")")\t\((.body_text // "") | oneline | clip(300))")
        end)'
 }
@@ -645,6 +690,158 @@ cmd_note_file() {
   fd_post_note "$ticket" "$text"
 }
 
+# notes <ticket> [note_id] - the notes of a ticket with their ids, or the whole
+# text of one of them. Replies and customer messages are not notes, and are left out.
+cmd_notes() {
+  local usage="usage: fd.sh notes <ticket> [note_id]"
+  [ $# -ge 1 ] && [ $# -le 2 ] || { echo "$usage" >&2; return 1; }
+  local id nid="${2:-}"
+  id=$(fd_ticket_id "$1")
+  [ -n "$id" ] || { echo "ERROR: not a ticket id or ticket link: $1"; return 1; }
+  case "$nid" in *[!0-9]*) echo "ERROR: not a note id: $nid"; return 1 ;; esac
+
+  local myid all
+  myid=$(fd_my_id)
+  case "$myid" in ERROR:*) printf '%s\n' "$myid"; return 0 ;; esac
+  all=$(fd_conversations "$id")
+  case "$all" in ERROR:*) printf '%s\n' "$all"; return 0 ;; esac
+
+  local capped=0
+  fd_conversations_capped "$all" && capped=1
+
+  if [ -z "$nid" ]; then
+    printf '%s' "$all" | jq -r --argjson me "$myid" --argjson capped "$capped" "$FD_JQ_DEFS"'
+      [.[] | select(.source == 2)] as $notes
+      | if ($notes | length) == 0 then "NONE"
+        else "INFO: \($notes | length) notes on this ticket, oldest first\(if $capped == 1 then ", from its first \(length) conversations" else "" end). \"you\" marks the notes you wrote.",
+          ($notes[] | scrub
+           | [(.id | tostring), (.created_at | day), kind,
+              (if .user_id == $me then "you" else "user \(.user_id // "?")" end),
+              "\((.attachments // []) | length) file(s)",
+              ((.body_text // "") | oneline | clip(120))] | @tsv)
+        end'
+    return 0
+  fi
+
+  local note
+  note=$(printf '%s' "$all" | jq --argjson n "$nid" 'map(select(.id == $n)) | first // empty')
+  if [ -z "$note" ]; then
+    fd_note_not_found "$id" "$nid" "$capped"
+    return 0
+  fi
+  printf '%s' "$note" | jq -r --argjson me "$myid" "$FD_JQ_DEFS"'
+    (.attachments // []) as $files
+    | (.body_text // "") as $text
+    | scrub
+    | "Note \(.id) on ticket #\(.ticket_id // "?"): \(if .source == 2 then kind else "not a note (\(kind))" end), by \(if .user_id == $me then "you" else "user \(.user_id // "?")" end), \(.created_at | day)\(if .last_edited_at then ", edited \(.last_edited_at | day)" else "" end)",
+      "Attachments (\($files | length)): \(if ($files | length) == 0 then "-" else [$files[] | (.name // "?") | tostring | oneline] | join(", ") end)",
+      "",
+      ($text | scrub_lines)'
+}
+
+# Internal: the ERROR for a note id the ticket's conversations do not hold.
+fd_note_not_found() {
+  local id="$1" nid="$2" capped="$3"
+  if [ "$capped" = 1 ]; then
+    echo "ERROR: note $nid is not among the conversations read of ticket #$id, which stop at FD_CONVERSATION_PAGES=${FD_CONVERSATION_PAGES:-10} pages. Raise it and retry."
+  else
+    echo "ERROR: note $nid is not on ticket #$id. Run 'fd.sh notes $id' to see its notes."
+  fi
+}
+
+# Internal: refuses, with one ERROR line, a note this skill must not edit, and
+# prints its attachment count when it may. $1 ticket id, $2 note id.
+# A note may be edited only when it is on that ticket, is a note and not a
+# reply, is private, and was written by the agent the API key belongs to.
+fd_check_own_note() {
+  local id="$1" nid="$2" myid all note
+  myid=$(fd_my_id)
+  case "$myid" in ERROR:*) printf '%s\n' "$myid"; return 1 ;; esac
+  all=$(fd_conversations "$id")
+  case "$all" in ERROR:*) printf '%s\n' "$all"; return 1 ;; esac
+
+  note=$(printf '%s' "$all" | jq --argjson n "$nid" 'map(select(.id == $n)) | first // empty')
+  if [ -z "$note" ]; then
+    local capped=0
+    fd_conversations_capped "$all" && capped=1
+    fd_note_not_found "$id" "$nid" "$capped"
+    return 1
+  fi
+
+  local on_ticket is_note is_private owner
+  on_ticket=$(printf '%s' "$note" | jq -r --argjson t "$id" '(.ticket_id // $t) == $t')
+  is_note=$(printf '%s' "$note" | jq -r '.source == 2')
+  is_private=$(printf '%s' "$note" | jq -r '.private == true')
+  owner=$(printf '%s' "$note" | jq -r '.user_id // "?" | tostring')
+
+  [ "$on_ticket" = true ] || { echo "ERROR: Freshdesk lists conversation $nid under ticket #$id, but says it belongs to another ticket. Nothing was changed."; return 1; }
+  [ "$is_note" = true ] || { echo "ERROR: conversation $nid is a reply or a customer message, not a note. This skill edits only private notes."; return 1; }
+  [ "$is_private" = true ] || { echo "ERROR: note $nid is PUBLIC: the customer may see it. This skill edits only private notes."; return 1; }
+  [ "$owner" = "$myid" ] || { echo "ERROR: note $nid was written by user $owner, not by you (agent $myid). This skill edits only your own notes."; return 1; }
+
+  printf '%s' "$note" | jq '(.attachments // []) | length'
+}
+
+# edit-note <ticket> <note_id> <file> - replaces the text of one of your own
+# private notes with the text of a file. Its attachments stay, and it stays private.
+cmd_edit_note() {
+  local usage="usage: fd.sh edit-note <ticket> <note_id> <file>"
+  if [ $# -ne 3 ]; then
+    echo "$usage" >&2
+    echo "It replaces the text of one of your own private notes, and nothing else: there is no option to make a note public." >&2
+    return 1
+  fi
+  local id nid="$2" file="$3"
+  id=$(fd_ticket_id "$1")
+  [ -n "$id" ] || { echo "ERROR: not a ticket id or ticket link: $1"; return 1; }
+  case "$nid" in ""|*[!0-9]*) echo "ERROR: not a note id: $nid"; return 1 ;; esac
+
+  [ -e "$file" ] || { echo "ERROR: note file not found: $file"; return 1; }
+  [ -r "$file" ] || { echo "ERROR: note file is not readable: $file"; return 1; }
+  [ -s "$file" ] || { echo "ERROR: note file is empty: $file"; return 1; }
+  local text
+  text=$(cat "$file") || { echo "ERROR: could not read the note file: $file"; return 1; }
+  [ -n "$(printf '%s' "$text" | tr -d '[:space:]')" ] || { echo "ERROR: the note is empty"; return 1; }
+  case "$text" in
+    *"$FRESHDESK_API_KEY"*) echo "ERROR: the note contains your Freshdesk API key; it was not sent."; return 1 ;;
+  esac
+
+  local before
+  before=$(fd_check_own_note "$id" "$nid") || { printf '%s\n' "$before"; return 1; }
+
+  # Only `body`: the request has no field that could make the note public, and
+  # without `attachments` the files already on the note are left as they are.
+  local payload res status body
+  payload=$(jq -n --arg t "$text" "{body: (\$t | $FD_JQ_HTML)}")
+  FD_EDITABLE_NOTE="$nid"
+  res=$(fd_curl PUT "/api/v2/conversations/$nid" -d "$payload")
+  FD_EDITABLE_NOTE=""
+  status=$(fd_status "$res")
+  body=$(fd_body "$res")
+  case "$status" in
+    200) ;;
+    000) echo "ERROR: network failure talking to Freshdesk ($BASE). The note may or may not have been changed: check it with 'fd.sh notes $id $nid' before editing again."; return 0 ;;
+    *) fd_error "$status" "$body" "note"; return 0 ;;
+  esac
+
+  local private got names
+  private=$(printf '%s' "$body" | jq -r '.private' 2>/dev/null || true)
+  if [ "$private" != "true" ]; then
+    echo "ERROR: after the edit, Freshdesk reports note $nid as PUBLIC (private: ${private:-?}). Open $(fd_ticket_link "$id") and check it now."
+    return 1
+  fi
+  echo "OK: private note $nid on ticket #$id updated - $(fd_ticket_link "$id")"
+
+  got=$(printf '%s' "$body" | jq -r '(.attachments // []) | length' 2>/dev/null || echo 0)
+  names=$(printf '%s' "$body" | jq -r "$FD_JQ_DEFS"'
+    [(.attachments // [])[] | (.name // "?") | tostring | oneline] | join(", ")' 2>/dev/null || true)
+  [ "$before" -eq 0 ] && [ "$got" -eq 0 ] && return 0
+  echo "Attachments ($got): ${names:--}"
+  if [ "$got" -lt "$before" ]; then
+    echo "WARNING: the note had $before file(s) before the edit, and Freshdesk now lists $got. Check $(fd_ticket_link "$id")."
+  fi
+}
+
 # Sourced (by the test suite, to reach fd_curl directly): define, do not run.
 [ "${BASH_SOURCE[0]}" = "$0" ] || return 0
 
@@ -655,7 +852,9 @@ case "${1:-}" in
   search)    shift; cmd_search "$@" ;;
   note)      shift; cmd_note "$@" ;;
   note-file) shift; cmd_note_file "$@" ;;
-  *) echo "usage: fd.sh {setup|whoami|ticket <id|url>|search <words|filter-query> [count]|note <ticket> <text> [--notify email]... [--attach file]...|note-file <ticket> <file> [--notify email]... [--attach file]...}" >&2
-     echo "Read-only, plus private notes. There is no reply, public note or ticket update, by design." >&2
+  notes)     shift; cmd_notes "$@" ;;
+  edit-note) shift; cmd_edit_note "$@" ;;
+  *) echo "usage: fd.sh {setup|whoami|ticket <id|url>|search <words|filter-query> [count]|note <ticket> <text> [--notify email]... [--attach file]...|note-file <ticket> <file> [--notify email]... [--attach file]...|notes <ticket> [note_id]|edit-note <ticket> <note_id> <file>}" >&2
+     echo "Read-only, plus private notes and edits to your own private notes. There is no reply, public note or ticket update, by design." >&2
      exit 1 ;;
 esac

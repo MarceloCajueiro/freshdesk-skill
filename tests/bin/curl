@@ -21,7 +21,9 @@
 #   CURL_FAIL_URLS    substrings; a matching URL exits 7 (connection failure)
 #   CURL_HTTP_STATUS  answer every call with this status ...
 #   CURL_HTTP_BODY    ... and this body (default: empty)
-#   CURL_NOTE_PUBLIC  the created note comes back with "private": false
+#   CURL_NOTE_PUBLIC  the created or edited note comes back with "private": false
+#   CURL_PUT_STATUS   answer a PUT with this status ...
+#   CURL_PUT_BODY     ... and this body; the reads before it are unaffected
 set -uo pipefail
 
 method="GET" url="" payload="" wfmt="" config="" forms="" files=()
@@ -70,6 +72,8 @@ answer() {
 
 [ -n "${CURL_HTTP_STATUS:-}" ] && answer "$CURL_HTTP_STATUS" "${CURL_HTTP_BODY:-}"
 
+[ "$method" = "PUT" ] && [ -n "${CURL_PUT_STATUS:-}" ] && answer "$CURL_PUT_STATUS" "${CURL_PUT_BODY:-}"
+
 path="${url#*/api/v2/}"
 query=""
 case "$path" in *\?*) query="${path#*\?}" ;; esac
@@ -100,5 +104,14 @@ if [ "$method" = "POST" ]; then
     created="$(printf '%s' "$created" | jq -c '.private = false')"
   fi
   answer 201 "$created"
+fi
+if [ "$method" = "PUT" ]; then
+  # An edited conversation comes back with the body that was sent, and every
+  # other field, attachments included, as it was.
+  updated="$(jq -c --argjson p "${payload:-null}" '. + {body: ($p.body // .body)}' "$fixture")"
+  if [ -n "${CURL_NOTE_PUBLIC:-}" ]; then
+    updated="$(printf '%s' "$updated" | jq -c '.private = false')"
+  fi
+  answer 200 "$updated"
 fi
 answer 200 "$(cat "$fixture")"

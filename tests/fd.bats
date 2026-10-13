@@ -227,7 +227,8 @@ lookup_snippet() {
   local c
   printf 'log\n' > "$TMP/a.log"
   for c in "whoami" "ticket 123" "search boletim" "search status:2" "note 123 hello" \
-           "note 123 hello --attach $TMP/a.log"; do
+           "note 123 hello --attach $TMP/a.log" "notes 124" "notes 124 8001" \
+           "edit-note 124 8001 $TMP/a.log"; do
     # shellcheck disable=SC2086
     fd $c
     [[ "$output" != *"FAKEKEY"* ]]
@@ -534,7 +535,7 @@ lookup_snippet() {
   done
 }
 
-@test "across every command, the only write is a POST to a ticket's notes" {
+@test "across every command, the only writes are a POST to a ticket's notes and a PUT of your own private note's body" {
   printf 'body\n' > "$TMP/n.txt"
   fd whoami
   fd ticket 123
@@ -543,17 +544,29 @@ lookup_snippet() {
   fd note 123 "a"
   fd note-file '#123' "$TMP/n.txt" --notify ana@example.com
   fd note 123 "b" --attach "$TMP/n.txt"
-  [ "$(writes | sort -u)" = "POST https://acme.freshdesk.com/api/v2/tickets/123/notes" ]
-  [ "$(writes | wc -l | tr -d ' ')" -eq 3 ]
+  fd notes 124
+  fd notes 124 8001
+  local n
+  for n in 8000 8001 8002 8003 8004 8101 2; do
+    fd edit-note 124 "$n" "$TMP/n.txt"
+  done
+  [ "$(writes | sort -u)" = "POST https://acme.freshdesk.com/api/v2/tickets/123/notes
+PUT https://acme.freshdesk.com/api/v2/conversations/8001" ]
+  [ "$(writes | wc -l | tr -d ' ')" -eq 4 ]
   local f
   for f in "$CURL_BODY_DIR"/body.*.json; do
-    [ "$(jq -r .private "$f")" = "true" ]
+    if [ "$(jq -r 'has("private")' "$f")" = "true" ]; then
+      [ "$(jq -r .private "$f")" = "true" ]
+    else
+      [ "$(jq -c 'keys' "$f")" = '["body"]' ]   # the edit
+    fi
   done
+  [ "$(ls "$CURL_BODY_DIR" | wc -l | tr -d ' ')" -eq 3 ]
   [ "$(forms | grep -c '^--form-string private=true$')" -eq 1 ]
   [ "$(forms | grep -c 'private=')" -eq 1 ]
 }
 
-@test "the HTTP layer refuses every write except a POST to a ticket's notes" {
+@test "the HTTP layer refuses every write except a POST to a ticket's notes and a cleared note's body" {
   # No command reaches these paths today; the allowlist is what keeps a future
   # command, or a crafted ticket argument, from replying to a customer.
   local call
@@ -563,6 +576,8 @@ lookup_snippet() {
               "POST /api/v2/tickets/123/notes/../reply" \
               "POST /api/v2/tickets" \
               "DELETE /api/v2/tickets/123" \
+              "POST /api/v2/conversations/8001" \
+              "DELETE /api/v2/conversations/8001" \
               "GET /other/path"; do
     run "$FD_BASH" -c "source '$FD'; fd_curl $call"
     [ "$status" -eq 0 ]
@@ -574,12 +589,49 @@ lookup_snippet() {
   [ "${lines[${#lines[@]}-1]}" = "201" ]
 }
 
+@test "the HTTP layer refuses a PUT that is not the body of the note the guards cleared" {
+  # Each line: the note cleared, then the request. Only a JSON object holding
+  # nothing but a string body, to that very note, goes out.
+  local -a calls=(
+    "|PUT /api/v2/conversations/8001 -d '{\"body\":\"x\"}'"
+    "8005|PUT /api/v2/conversations/8001 -d '{\"body\":\"x\"}'"
+    "8001|PUT /api/v2/conversations/8001 -d '{\"body\":\"x\",\"private\":false}'"
+    "8001|PUT /api/v2/conversations/8001 -d '{\"private\":false}'"
+    "8001|PUT /api/v2/conversations/8001 -d '{\"body\":\"x\",\"attachments\":[]}'"
+    "8001|PUT /api/v2/conversations/8001 -d '{\"body\":1}'"
+    "8001|PUT /api/v2/conversations/8001 -d '[\"body\"]'"
+    "8001|PUT /api/v2/conversations/8001 -d 'not json'"
+    "8001|PUT /api/v2/conversations/8001 --form-string body=x"
+    "8001|PUT /api/v2/conversations/8001 -F attachments[]=@/etc/hosts"
+    "8001|PUT /api/v2/conversations/8001 -d '{\"body\":\"x\"}' -d '{\"private\":false}'"
+    "8001|PUT /api/v2/conversations/8001 --data '{\"body\":\"x\"}'"
+    "8001|PUT /api/v2/conversations/8001"
+    "8001|PUT /api/v2/conversations/8001?private=false -d '{\"body\":\"x\"}'"
+    "8001|PUT /api/v2/conversations/ -d '{\"body\":\"x\"}'"
+    "8001|PUT /api/v2/conversations/8001/x -d '{\"body\":\"x\"}'"
+  )
+  local c
+  for c in "${calls[@]}"; do
+    run "$FD_BASH" -c "source '$FD'; FD_EDITABLE_NOTE='${c%%|*}'; fd_curl ${c#*|}"
+    [ "$status" -eq 0 ]
+    [ "${lines[${#lines[@]}-1]}" = "refused" ]
+  done
+  [ ! -s "$CURL_LOG" ]
+
+  run "$FD_BASH" -c "source '$FD'; FD_EDITABLE_NOTE=8001; fd_curl PUT /api/v2/conversations/8001 -d '{\"body\":\"x\"}'"
+  [ "${lines[${#lines[@]}-1]}" = "200" ]
+  [ "$(writes)" = "PUT https://acme.freshdesk.com/api/v2/conversations/8001" ]
+}
+
 @test "reads are retried, a note is never retried" {
   # A retried POST after a timeout can create the same note twice.
   printf 'log\n' > "$TMP/a.log"
   fd ticket 123
   fd note 123 "x"
   fd note 123 "x" --attach "$TMP/a.log"
+  fd edit-note 124 8001 "$TMP/a.log"
+  [ "$(grep -c '/conversations/8001' "$CURL_ARGV_LOG")" -eq 1 ]
+  [ "$(grep '/conversations/8001' "$CURL_ARGV_LOG" | grep -c -- '--retry')" -eq 0 ]
   [ "$(grep -c '/notes' "$CURL_ARGV_LOG")" -eq 2 ]
   grep 'agents/me\|tickets/123?include' "$CURL_ARGV_LOG" | grep -q -- '--retry'
   [ "$(grep '/notes' "$CURL_ARGV_LOG" | grep -c -- '--retry')" -eq 0 ]
@@ -834,6 +886,257 @@ lookup_snippet() {
     fd note 123 "x" --attach "$TMP/a.txt" --attach "$TMP/b.txt"
   [ "${lines[1]}" = "Attachments (1): a.txt" ]
   [[ "${lines[2]}" == "WARNING: 2 file(s) sent, but Freshdesk lists 1 on the note."* ]]
+}
+
+# --- notes: listing a ticket's notes -------------------------------------------
+
+@test "notes lists every note with its id, date, kind, author, files and text, and only notes" {
+  fd notes 124
+  [ "$status" -eq 0 ]
+  [ "${lines[0]}" = 'INFO: 4 notes on this ticket, oldest first. "you" marks the notes you wrote.' ]
+  [ "${lines[1]}" = $'8001\t2026-10-05 09:00\tPRIVATE NOTE\tyou\t2 file(s)\tArquivos do diario anexados. Senha em seguida.' ]
+  [ "${lines[2]}" = $'8002\t2026-10-05 10:00\tPUBLIC NOTE\tyou\t0 file(s)\tNota publica minha.' ]
+  [ "${lines[3]}" = $'8003\t2026-10-05 11:00\tPRIVATE NOTE\tuser 9002\t0 file(s)\tNota privada de outro agente.' ]
+  [ "${lines[4]}" = $'8005\t2026-10-05 13:00\tPRIVATE NOTE\tyou\t0 file(s)\tNota privada sem anexos.' ]
+  [ "${#lines[@]}" -eq 5 ]   # the customer message and the reply are not notes
+  [ -z "$(writes)" ]
+}
+
+@test "notes with a note id prints that note's whole text, its files and its author" {
+  fd notes 124 8001
+  [ "$status" -eq 0 ]
+  [ "${lines[0]}" = "Note 8001 on ticket #124: PRIVATE NOTE, by you, 2026-10-05 09:00" ]
+  [ "${lines[1]}" = "Attachments (2): diario.zip, notas.zip" ]
+  [ "$output" = "Note 8001 on ticket #124: PRIVATE NOTE, by you, 2026-10-05 09:00
+Attachments (2): diario.zip, notas.zip
+
+Arquivos do diario anexados.
+Senha em seguida." ]
+  fd notes 124 8005
+  [ "${lines[0]}" = "Note 8005 on ticket #124: PRIVATE NOTE, by you, 2026-10-05 13:00, edited 2026-10-06 08:00" ]
+  fd notes 124 8003
+  [[ "${lines[0]}" == *"by user 9002"* ]]
+  fd notes 124 8004
+  [[ "${lines[0]}" == *"not a note (PUBLIC REPLY)"* ]]
+}
+
+@test "notes does not cut a long note, and strips control characters but keeps line breaks" {
+  cp -R "$FIXTURES" "$TMP/fx"
+  jq -n --arg t "$(printf 'x%.0s' $(seq 1 400))" \
+    '[{id:1, body_text:("a\u001b[2Jb\r\nc\u009bd\n" + $t), private:true, source:2, user_id:9001,
+       ticket_id:124, created_at:"2026-10-01T10:00:00Z"}]' > "$TMP/fx/tickets.124.conversations.json"
+  FIXTURES="$TMP/fx" fd notes 124 1
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s' "$output" | LC_ALL=C grep -c $'\e')" -eq 0 ]
+  [ "$(printf '%s' "$output" | LC_ALL=C grep -c $'\r')" -eq 0 ]
+  [ "$(printf '%s' "$output" | LC_ALL=C grep -c $'\xc2\x9b')" -eq 0 ]
+  # `lines` skips the blank line under the header.
+  [ "${lines[2]}" = "a [2Jb" ]
+  [ "${lines[3]}" = "c d" ]
+  [ "${#lines[4]}" -eq 400 ]
+  FIXTURES="$TMP/fx" fd notes 124
+  [[ "${lines[1]}" == *" [...]" ]]   # the list clips it
+}
+
+@test "notes reports NONE, an unknown note and a bad argument plainly" {
+  fd notes 123 2
+  [ "$status" -eq 0 ]
+  [ "${lines[0]}" = "Note 2 on ticket #123: PRIVATE NOTE, by user 9002, 2026-10-01 10:00" ]
+  fd notes 125 8001
+  [ "$output" = "ERROR: note 8001 is not on ticket #125. Run 'fd.sh notes 125' to see its notes." ]
+  cp -R "$FIXTURES" "$TMP/fx"
+  echo '[]' > "$TMP/fx/tickets.124.conversations.json"
+  FIXTURES="$TMP/fx" fd notes 124
+  [ "$output" = "NONE" ]
+  : > "$CURL_LOG"
+  fd notes 124 abc
+  [ "$status" -ne 0 ]
+  fd notes abc
+  [ "$status" -ne 0 ]
+  fd notes
+  [ "$status" -ne 0 ]
+  [ ! -s "$CURL_LOG" ]
+  fd notes 999
+  [[ "$output" == "ERROR: not found (404)"* ]]
+}
+
+# --- edit-note: your own private notes only ----------------------------------
+
+@test "edit-note replaces the body of your own private note, and sends nothing but the body" {
+  printf 'Arquivos anexados.\nSenha: s3nh4 & <ok>\n' > "$TMP/n.txt"
+  fd edit-note 124 8001 "$TMP/n.txt"
+  [ "$status" -eq 0 ]
+  [ "${lines[0]}" = "OK: private note 8001 on ticket #124 updated - https://acme.freshdesk.com/a/tickets/124" ]
+  [ "${lines[1]}" = "Attachments (2): diario.zip, notas.zip" ]
+  [ "${#lines[@]}" -eq 2 ]
+  [ "$(writes)" = "PUT https://acme.freshdesk.com/api/v2/conversations/8001" ]
+  [ "$(payload | jq -c .)" = '{"body":"Arquivos anexados.<br>Senha: s3nh4 &amp; &lt;ok&gt;"}' ]
+  # The guards read who you are and the ticket's own notes, before the write.
+  [ "$(head -1 "$CURL_LOG")" = "GET https://acme.freshdesk.com/api/v2/agents/me" ]
+  grep -q '^GET https://acme.freshdesk.com/api/v2/tickets/124/conversations' "$CURL_LOG"
+  [ "$(tail -1 "$CURL_LOG")" = "PUT https://acme.freshdesk.com/api/v2/conversations/8001" ]
+  [ ! -s "$CURL_FORM_LOG" ]   # never multipart: no new files, the old ones stay
+}
+
+@test "edit-note accepts a ticket link and #id, and a note without files reports none" {
+  printf 'x\n' > "$TMP/n.txt"
+  fd edit-note 'https://acme.freshdesk.com/a/tickets/124' 8005 "$TMP/n.txt"
+  [ "$status" -eq 0 ]
+  [ "$output" = "OK: private note 8005 on ticket #124 updated - https://acme.freshdesk.com/a/tickets/124" ]
+  fd edit-note '#124' 8005 "$TMP/n.txt"
+  [ "$status" -eq 0 ]
+  [ "$(writes | wc -l | tr -d ' ')" -eq 2 ]
+}
+
+@test "edit-note refuses a public note, before any write" {
+  printf 'x\n' > "$TMP/n.txt"
+  fd edit-note 124 8002 "$TMP/n.txt"
+  [ "$status" -ne 0 ]
+  [ "$output" = "ERROR: note 8002 is PUBLIC: the customer may see it. This skill edits only private notes." ]
+  [ -z "$(writes)" ]
+}
+
+@test "edit-note refuses a private note another agent wrote, before any write" {
+  printf 'x\n' > "$TMP/n.txt"
+  fd edit-note 124 8003 "$TMP/n.txt"
+  [ "$status" -ne 0 ]
+  [ "$output" = "ERROR: note 8003 was written by user 9002, not by you (agent 9001). This skill edits only your own notes." ]
+  [ -z "$(writes)" ]
+  # Who you are comes from the API key, every time.
+  cp -R "$FIXTURES" "$TMP/fx"
+  jq '.id = 9002' "$FIXTURES/agents.me.json" > "$TMP/fx/agents.me.json"
+  FIXTURES="$TMP/fx" fd edit-note 124 8001 "$TMP/n.txt"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"written by user 9001, not by you (agent 9002)"* ]]
+  [ -z "$(writes)" ]
+}
+
+@test "edit-note refuses a reply or a customer message, before any write" {
+  printf 'x\n' > "$TMP/n.txt"
+  local n
+  for n in 8004 8000; do
+    fd edit-note 124 "$n" "$TMP/n.txt"
+    [ "$status" -ne 0 ]
+    [ "$output" = "ERROR: conversation $n is a reply or a customer message, not a note. This skill edits only private notes." ]
+  done
+  [ -z "$(writes)" ]
+}
+
+@test "edit-note refuses a note that is not on the ticket given, even your own private one" {
+  printf 'x\n' > "$TMP/n.txt"
+  fd edit-note 124 8101 "$TMP/n.txt"   # yours, private, on ticket 125
+  [ "$status" -ne 0 ]
+  [ "$output" = "ERROR: note 8101 is not on ticket #124. Run 'fd.sh notes 124' to see its notes." ]
+  fd edit-note 124 2 "$TMP/n.txt"
+  [ "$status" -ne 0 ]
+  [ -z "$(writes)" ]
+  # Listed under the ticket, but saying it belongs to another: refused too.
+  cp -R "$FIXTURES" "$TMP/fx"
+  jq 'map(if .id == 8001 then .ticket_id = 125 else . end)' "$FIXTURES/tickets.124.conversations.json" \
+    > "$TMP/fx/tickets.124.conversations.json"
+  FIXTURES="$TMP/fx" fd edit-note 124 8001 "$TMP/n.txt"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"belongs to another ticket"* ]]
+  [ -z "$(writes)" ]
+}
+
+@test "edit-note finds a note past the first page, and says when it stopped reading" {
+  printf 'x\n' > "$TMP/n.txt"
+  cp -R "$FIXTURES" "$TMP/fx"
+  jq -n '[range(1;101) | {id:., body_text:"m", private:false, incoming:true, source:0, user_id:1,
+          ticket_id:124, created_at:"2026-10-01T10:00:00Z"}]' > "$TMP/fx/tickets.124.conversations.json"
+  cp "$FIXTURES/tickets.124.conversations.json" "$TMP/fx/tickets.124.conversations.p2.json"
+  FIXTURES="$TMP/fx" fd edit-note 124 8001 "$TMP/n.txt"
+  [ "$status" -eq 0 ]
+  [ "$(writes)" = "PUT https://acme.freshdesk.com/api/v2/conversations/8001" ]
+  : > "$CURL_LOG"
+  FD_CONVERSATION_PAGES=1 FIXTURES="$TMP/fx" fd edit-note 124 8001 "$TMP/n.txt"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"not among the conversations read of ticket #124"*"FD_CONVERSATION_PAGES=1"* ]]
+  [ -z "$(writes)" ]
+}
+
+@test "edit-note refuses every extra option, an empty or missing file and bad ids, before any request" {
+  printf 'x\n' > "$TMP/n.txt"
+  : > "$TMP/empty.txt"
+  printf '  \n\t\n' > "$TMP/blank.txt"
+  local opt
+  for opt in --public --private=false "--private false" --attach --notify; do
+    # shellcheck disable=SC2086
+    fd edit-note 124 8001 "$TMP/n.txt" $opt
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"no option to make a note public"* ]]
+  done
+  fd edit-note 124 8001
+  [ "$status" -ne 0 ]
+  fd edit-note 124 8001 "$TMP/empty.txt"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"note file is empty"* ]]
+  fd edit-note 124 8001 "$TMP/blank.txt"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"the note is empty"* ]]
+  fd edit-note 124 8001 "$TMP/missing.txt"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"not found"* ]]
+  fd edit-note 124 abc "$TMP/n.txt"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"not a note id"* ]]
+  fd edit-note 124 '8001/../../tickets/124' "$TMP/n.txt"
+  [ "$status" -ne 0 ]
+  fd edit-note abc 8001 "$TMP/n.txt"
+  [ "$status" -ne 0 ]
+  [ ! -s "$CURL_LOG" ]
+}
+
+@test "edit-note refuses a text that contains the API key, or the config file, before any request" {
+  printf 'the key is FAKEKEY\n' > "$TMP/n.txt"
+  fd edit-note 124 8001 "$TMP/n.txt"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"contains your Freshdesk API key"* ]]
+  [[ "$output" != *"FAKEKEY"* ]]
+  fd edit-note 124 8001 "$XDG_CONFIG_HOME/freshdesk/config"
+  [ "$status" -ne 0 ]
+  [ ! -s "$CURL_LOG" ]
+}
+
+@test "the text of an edit cannot smuggle private:false or attachments into the request" {
+  printf '%s' '", "private": false, "attachments": [], "x": "' > "$TMP/n.txt"
+  fd edit-note 124 8001 "$TMP/n.txt"
+  [ "$status" -eq 0 ]
+  [ "$(payload | jq -r 'keys | join(",")')" = "body" ]
+}
+
+@test "a note Freshdesk reports as public after the edit is reported loudly" {
+  printf 'x\n' > "$TMP/n.txt"
+  CURL_NOTE_PUBLIC=1 fd edit-note 124 8001 "$TMP/n.txt"
+  [ "$status" -ne 0 ]
+  [[ "$output" == "ERROR: after the edit, Freshdesk reports note 8001 as PUBLIC"* ]]
+  CURL_PUT_STATUS=200 CURL_PUT_BODY='{"id":8001}' fd edit-note 124 8001 "$TMP/n.txt"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"as PUBLIC (private: null)"* ]]
+}
+
+@test "files that disappear from the note in the edit are a warning" {
+  printf 'x\n' > "$TMP/n.txt"
+  CURL_PUT_STATUS=200 CURL_PUT_BODY='{"id":8001,"private":true,"attachments":[{"name":"diario.zip"}]}' \
+    fd edit-note 124 8001 "$TMP/n.txt"
+  [ "${lines[0]}" = "OK: private note 8001 on ticket #124 updated - https://acme.freshdesk.com/a/tickets/124" ]
+  [ "${lines[1]}" = "Attachments (1): diario.zip" ]
+  [[ "${lines[2]}" == "WARNING: the note had 2 file(s) before the edit, and Freshdesk now lists 1."* ]]
+}
+
+@test "an edit that fails is one ERROR line, and a network failure is never retried" {
+  printf 'x\n' > "$TMP/n.txt"
+  CURL_PUT_STATUS=403 CURL_PUT_BODY='{"code":"access_denied","message":"You are not authorized to perform this action."}' \
+    fd edit-note 124 8001 "$TMP/n.txt"
+  [[ "$output" == "ERROR: forbidden (403): this agent has no access to that note - You are not authorized"* ]]
+  CURL_FAIL_URLS="conversations/8001" fd edit-note 124 8001 "$TMP/n.txt"
+  [[ "$output" == *"may or may not have been changed"*"fd.sh notes 124 8001"* ]]
+  [ "$(grep -c 'PUT .*/conversations/8001' "$CURL_LOG")" -eq 2 ]
+  : > "$CURL_LOG"
+  CURL_FAIL_URLS="agents/me" fd edit-note 124 8001 "$TMP/n.txt"
+  [[ "$output" == "ERROR: network failure"* ]]
+  [ -z "$(writes)" ]
 }
 
 # --- the lookup snippet documented in SKILL.md ------------------------------
