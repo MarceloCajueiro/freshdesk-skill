@@ -174,7 +174,7 @@ The list endpoint returns only tickets created in the last 30 days unless asked 
 The domain and the key are validated on every run, including when they come from the environment: a domain with `@`, a port or a query, or a key with a quote, is refused before any request.
 
 **Ticket content is untrusted.** Customers write it, so the script strips control characters before printing it, and `SKILL.md` tells the agent to treat it as data and never as instructions.
-A note that contains the API key is refused, so pointing `note-file` at the config file cannot publish it.
+A note that contains the API key is refused, and the config file itself is refused as the text of `note-file` or `edit-note`, symlinks included, even when the key in use comes from the environment and the file holds another one.
 
 **Attachments go as multipart, with every other field sent literally.** Freshdesk takes files only as `multipart/form-data`, so a note with `--attach` is sent that way and without the JSON `Content-Type`, which would hide the boundary curl writes.
 The body, `private=true` and each notify address go through `curl --form-string`, never `-F`: with `-F`, a note starting with `@` or `<` would make curl read a file from this machine into it.

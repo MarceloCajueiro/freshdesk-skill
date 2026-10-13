@@ -675,6 +675,16 @@ cmd_note() {
   fd_post_note "$ticket" "$text"
 }
 
+# Internal: refuses this skill's own config file as the text of a note. The
+# content check on the text only knows the key in use, and a key from the
+# environment wins over the file's, so the file can hold another one.
+fd_not_config_file() {
+  if [ "$1" -ef "$CONFIG_FILE" ]; then
+    echo "ERROR: $1 is this skill's credentials file; it was not sent."
+    return 1
+  fi
+}
+
 # note-file <ticket> <file> [--notify email]... [--attach file]... - the text comes from a file
 cmd_note_file() {
   local usage="usage: fd.sh note-file <ticket> <file> [--notify agent@example.com]... [--attach file]..."
@@ -685,6 +695,7 @@ cmd_note_file() {
   [ -e "$file" ] || { echo "ERROR: note file not found: $file"; return 1; }
   [ -r "$file" ] || { echo "ERROR: note file is not readable: $file"; return 1; }
   [ -s "$file" ] || { echo "ERROR: note file is empty: $file"; return 1; }
+  fd_not_config_file "$file" || return 1
   local text
   text=$(cat "$file") || { echo "ERROR: could not read the note file: $file"; return 1; }
   fd_post_note "$ticket" "$text"
@@ -799,6 +810,7 @@ cmd_edit_note() {
   [ -e "$file" ] || { echo "ERROR: note file not found: $file"; return 1; }
   [ -r "$file" ] || { echo "ERROR: note file is not readable: $file"; return 1; }
   [ -s "$file" ] || { echo "ERROR: note file is empty: $file"; return 1; }
+  fd_not_config_file "$file" || return 1
   local text
   text=$(cat "$file") || { echo "ERROR: could not read the note file: $file"; return 1; }
   [ -n "$(printf '%s' "$text" | tr -d '[:space:]')" ] || { echo "ERROR: the note is empty"; return 1; }
@@ -826,10 +838,15 @@ cmd_edit_note() {
 
   local private got names
   private=$(printf '%s' "$body" | jq -r '.private' 2>/dev/null || true)
-  if [ "$private" != "true" ]; then
-    echo "ERROR: after the edit, Freshdesk reports note $nid as PUBLIC (private: ${private:-?}). Open $(fd_ticket_link "$id") and check it now."
-    return 1
-  fi
+  case "$private" in
+    true) ;;
+    false)
+      echo "ERROR: after the edit, Freshdesk reports note $nid as PUBLIC. Open $(fd_ticket_link "$id") and check it now."
+      return 1 ;;
+    *)
+      echo "ERROR: the edit was sent, but Freshdesk's answer does not confirm note $nid is still private. Open $(fd_ticket_link "$id") and check it now."
+      return 1 ;;
+  esac
   echo "OK: private note $nid on ticket #$id updated - $(fd_ticket_link "$id")"
 
   got=$(printf '%s' "$body" | jq -r '(.attachments // []) | length' 2>/dev/null || echo 0)

@@ -1099,6 +1099,22 @@ Senha em seguida." ]
   [ ! -s "$CURL_LOG" ]
 }
 
+@test "the config file is refused as a note's text even when it holds another key than the one in use" {
+  # The environment's key wins, so the content check would not see the file's.
+  ln -s "$XDG_CONFIG_HOME/freshdesk/config" "$TMP/innocent.txt"
+  local f
+  for f in "$XDG_CONFIG_HOME/freshdesk/config" "$TMP/innocent.txt"; do
+    run env FRESHDESK_API_KEY=ENVKEY "$FD_BASH" "$FD" edit-note 124 8001 "$f"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"credentials file"* ]]
+    [[ "$output" != *"FAKEKEY"* ]]
+    run env FRESHDESK_API_KEY=ENVKEY "$FD_BASH" "$FD" note-file 123 "$f"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"credentials file"* ]]
+  done
+  [ ! -s "$CURL_LOG" ]
+}
+
 @test "the text of an edit cannot smuggle private:false or attachments into the request" {
   printf '%s' '", "private": false, "attachments": [], "x": "' > "$TMP/n.txt"
   fd edit-note 124 8001 "$TMP/n.txt"
@@ -1111,9 +1127,13 @@ Senha em seguida." ]
   CURL_NOTE_PUBLIC=1 fd edit-note 124 8001 "$TMP/n.txt"
   [ "$status" -ne 0 ]
   [[ "$output" == "ERROR: after the edit, Freshdesk reports note 8001 as PUBLIC"* ]]
-  CURL_PUT_STATUS=200 CURL_PUT_BODY='{"id":8001}' fd edit-note 124 8001 "$TMP/n.txt"
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"as PUBLIC (private: null)"* ]]
+  # An answer that does not say is not taken as private, nor called public.
+  local b
+  for b in '{"id":8001}' '<html>OK</html>' ''; do
+    CURL_PUT_STATUS=200 CURL_PUT_BODY="$b" fd edit-note 124 8001 "$TMP/n.txt"
+    [ "$status" -ne 0 ]
+    [[ "$output" == "ERROR: the edit was sent, but Freshdesk's answer does not confirm note 8001 is still private."* ]]
+  done
 }
 
 @test "files that disappear from the note in the edit are a warning" {
