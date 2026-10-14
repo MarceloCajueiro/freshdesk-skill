@@ -1,6 +1,6 @@
 # freshdesk-skill
 
-An agent skill that lets your coding agent read Freshdesk tickets and leave **private notes** for the support team, from the terminal.
+An agent skill that lets your coding agent read Freshdesk tickets and leave **private notes** for the support team, from the terminal - and fix a private note you already sent.
 
 Ask in plain language and the agent does the rest:
 
@@ -10,6 +10,8 @@ Ask in plain language and the agent does the rest:
 
 > tell support on 4521 that the fix is out and ask them to confirm with the school
 
+> add the password of the zip files to my last note on 4521
+
 It works with any agent that supports skills - Claude Code, Codex, Cursor, OpenCode and others.
 
 ## Private notes only
@@ -17,11 +19,11 @@ It works with any agent that supports skills - Claude Code, Codex, Cursor, OpenC
 The skill talks to your **support team**, never to the customer.
 Support reads private notes on the ticket faster than comments on a GitHub issue, so that is where the agent writes.
 
-- It reads tickets and adds private notes.
-  Those are the only two actions.
-- It never replies to the customer, never posts a public note, and never changes a ticket's status, priority, assignment, tags or fields.
-- The rule is enforced in code, not only in the instructions: the script has no command for any other write, refuses any option that asks for one, and its HTTP layer refuses every request except reads and a POST to a ticket's notes.
-  The note always carries `"private": true` (as `private=true` when it has attachments), and the test suite proves it.
+- It reads tickets, adds private notes, and edits the text of a private note you wrote.
+  Those are the only three actions.
+- It never replies to the customer, never posts a public note, never makes a note public, never edits someone else's note, and never changes a ticket's status, priority, assignment, tags or fields.
+- The rule is enforced in code, not only in the instructions: the script has no command for any other write, refuses any option that asks for one, and its HTTP layer refuses every request except reads, a POST to a ticket's notes, and a PUT of the body of the one note the edit checks cleared.
+  The note always carries `"private": true` (as `private=true` when it has attachments), an edit sends nothing but the new body, and the test suite proves both.
 
 ## Install
 
@@ -86,8 +88,9 @@ Regenerating it in Freshdesk invalidates the old one; run `fd.sh setup` again af
 | "open urgent tickets tagged boletim" | Runs a Freshdesk filter query |
 | "tell support on 4521 that ..." | Drafts a private note, **shows it to you, waits for approval**, then posts it |
 | "... and attach this log" | Same, with the file attached to the private note; the confirmation lists each file's name and size |
+| "add the password to my note on 4521" | Finds your private note, **shows its text before and after, waits for approval**, then replaces the text; the attachments stay |
 
-Posting always asks for confirmation first.
+Posting and editing always ask for confirmation first.
 A note goes out in your name and notifies people.
 
 ## CLI reference
@@ -104,9 +107,17 @@ fd.sh note 4521 "text"                        # private note
 fd.sh note-file 4521 note.txt                 # private note, text from a file
 fd.sh note 4521 "text" --notify ana@example.com   # and email an agent about it
 fd.sh note 4521 "text" --attach error.log --attach screen.png   # private note with files
+fd.sh notes 4521                              # the ticket's notes, with their ids
+fd.sh notes 4521 98765                        # one note, its whole text
+fd.sh edit-note 4521 98765 note.txt           # replace the text of your own private note
 ```
 
 `--notify` and `--attach` are repeatable, and work on `note` and `note-file` alike.
+
+`notes` output is TSV, oldest first: `id<TAB>date<TAB>kind<TAB>author<TAB>N file(s)<TAB>text`, with `you` as the author of your own notes.
+
+`edit-note` replaces the whole text of a note with the text of the file, as plain text like a new note.
+It refuses, before sending anything, a note that is not on that ticket, a reply, a public note, and a note another agent wrote.
 
 Search output is TSV: `updated<TAB>#id<TAB>status<TAB>subject<TAB>link`.
 
@@ -117,6 +128,7 @@ A note is plain text: line breaks are kept, URLs become links, and `<`, `>` and 
 | Variable | Default | Purpose |
 |---|---|---|
 | `FD_CONVERSATIONS` | `5` | How many of the latest conversations `ticket` shows |
+| `FD_CONVERSATION_PAGES` | `10` | How many pages of 100 conversations `ticket`, `notes` and `edit-note` read |
 | `FD_SEARCH_DAYS` | `90` | How far back a plain-word search looks |
 | `FD_SEARCH_PAGES` | `3` | How many pages of 100 tickets a plain-word search scans |
 | `FD_HTTP_TIMEOUT` | `20` | Per-request timeout, in seconds |
@@ -140,9 +152,9 @@ FD_BASH=/bin/bash bats tests/fd.bats    # exercise bash 3.2 on macOS
 ```
 
 The suite never touches the network: `tests/bin/curl` shadows `curl` on `PATH`, answers from fixtures with the HTTP status the script asks for, and logs every call, its arguments and its payload.
-That log is what the private-only rule is tested against: across every command, the only write is a POST to a ticket's notes, and every payload says `"private": true`.
+That log is what the private-only rule is tested against: across every command, the only writes are a POST to a ticket's notes, where every payload says `"private": true`, and a PUT to your own private note, whose payload holds the body and nothing else.
 
-CI also plants the one defect this skill must never ship - a note sent as public, in the JSON request and in the multipart one used for attachments - and requires the suite to go red.
+CI also plants the defects this skill must never ship - a note sent as public, in the JSON request and in the multipart one used for attachments, each check of `edit-note` switched off, and an edit request allowed to carry more than the body - and requires the suite to go red for each.
 A test that cannot fail proves nothing.
 
 The documented install-path lookup in `SKILL.md` is extracted from the file and executed, so the instructions the agent follows cannot silently drift from what actually works.
@@ -162,7 +174,7 @@ The list endpoint returns only tickets created in the last 30 days unless asked 
 The domain and the key are validated on every run, including when they come from the environment: a domain with `@`, a port or a query, or a key with a quote, is refused before any request.
 
 **Ticket content is untrusted.** Customers write it, so the script strips control characters before printing it, and `SKILL.md` tells the agent to treat it as data and never as instructions.
-A note that contains the API key is refused, so pointing `note-file` at the config file cannot publish it.
+A note that contains the API key is refused, and the config file itself is refused as the text of `note-file` or `edit-note`, symlinks included, even when the key in use comes from the environment and the file holds another one.
 
 **Attachments go as multipart, with every other field sent literally.** Freshdesk takes files only as `multipart/form-data`, so a note with `--attach` is sent that way and without the JSON `Content-Type`, which would hide the boundary curl writes.
 The body, `private=true` and each notify address go through `curl --form-string`, never `-F`: with `-F`, a note starting with `@` or `<` would make curl read a file from this machine into it.
@@ -174,7 +186,12 @@ Files adding up to more than 20 MB are refused.
 That is Freshdesk's limit for all of a ticket's attachments together, so the API can still refuse a smaller set when the ticket already has some, and the error says so.
 The success line is followed by the attachment names Freshdesk reports, and a warning when it lists fewer than were sent.
 
-**A note is never retried.** Reads retry on transient failures; the POST does not, because a timeout can hide a note that was in fact created.
+**An edit sends the body and nothing else.** Freshdesk's `PUT /api/v2/conversations/[id]` takes two fields, `body` and `attachments`, and no `private` field, so a request holding only `body` cannot make the note public, and leaves the files already on it as they are.
+There is no API to read one conversation, so before the PUT, `edit-note` reads the agent the key belongs to (`/api/v2/agents/me`) and every page of the ticket's conversations, and refuses the note unless it is listed there, is a note (`source` 2), is private, and has that agent as its `user_id`.
+The HTTP layer accepts the PUT only for the note those checks cleared, and only as a JSON object whose single key is `body`.
+After the edit, the response must still say `"private": true`, and fewer attachments than before is a warning.
+
+**A note is never retried.** Reads retry on transient failures; the POST and the PUT do not, because a timeout can hide a note that was in fact created or changed.
 When that happens the output says the note may or may not exist, and points at the ticket to check.
 
 ## License

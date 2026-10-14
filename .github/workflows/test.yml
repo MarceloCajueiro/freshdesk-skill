@@ -45,15 +45,23 @@ jobs:
       - name: Run suite under /bin/bash (bash 3.2 on macOS)
         run: FD_BASH=/bin/bash bats tests/fd.bats
 
-      - name: Suite must catch a note sent as public
-        # A suite that cannot fail proves nothing. The one defect this skill must
-        # never ship is a public note, so CI plants it and expects red - once in
-        # the JSON payload and once in the multipart form a note with files uses.
+      - name: Suite must catch a note sent as public, or an edit to a note that is not yours
+        # A suite that cannot fail proves nothing. The defects this skill must
+        # never ship are a public note and an edit it has no right to make, so CI
+        # plants each and expects red: a public note in the JSON payload and in
+        # the multipart form a note with files uses, each guard of edit-note
+        # switched off, and the HTTP layer letting a PUT carry more than a body.
         run: |
-          for mutation in 's/private: true}/private: false}/' 's/private=true/private=false/'; do
+          for mutation in 's/private: true}/private: false}/' 's/private=true/private=false/' \
+                          's/\[ "\$is_private" = true \]/true/' 's/\[ "\$owner" = "\$myid" \]/true/' \
+                          's/\[ "\$on_ticket" = true \]/true/' 's/\[ "\$is_note" = true \]/true/' \
+                          's/keys == \["body"\]/true/'; do
             sed "$mutation" freshdesk/fd.sh > /tmp/public_fd.sh
+            # Executable, as the original is: tests that run it directly must
+            # fail because of the mutation, not because of a missing exec bit.
+            chmod +x /tmp/public_fd.sh
             if cmp -s freshdesk/fd.sh /tmp/public_fd.sh; then
-              echo "The mutation '$mutation' did not apply: the note request changed shape. Update this step."
+              echo "The mutation '$mutation' did not apply: the code it targets changed shape. Update this step."
               exit 1
             fi
             if FD=/tmp/public_fd.sh bats tests/fd.bats > /tmp/public.log 2>&1; then
